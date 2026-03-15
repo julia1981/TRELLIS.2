@@ -1,4 +1,5 @@
 from typing import *
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -475,6 +476,46 @@ class SparseUnetVaeDecoder(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
+    def _low_vram_cleanup(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        gc.collect()
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    def _prepare_blocks_for_low_vram(self) -> None:
+        for res in self.blocks:
+            res.cpu()
+        self._low_vram_cleanup()
+
+    def _run_block_low_vram(
+        self,
+        block: nn.Module,
+        h: sp.SparseTensor,
+        subdiv: Optional[sp.SparseTensor] = None,
+    ):
+        block.to(h.device)
+        try:
+            if subdiv is not None:
+                subdiv_device = getattr(subdiv, "device", None)
+                if subdiv_device is not None and str(subdiv_device) != str(h.device) and hasattr(subdiv, "to"):
+                    subdiv = subdiv.to(h.device)
+                if hasattr(subdiv, "clear_spatial_cache"):
+                    subdiv.clear_spatial_cache()
+            if subdiv is None:
+                return block(h)
+            return block(h, subdiv=subdiv)
+        finally:
+            block.cpu()
+            self._low_vram_cleanup()
+
     def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
@@ -483,18 +524,31 @@ class SparseUnetVaeDecoder(nn.Module):
         h = h.type(self.dtype)
         subs_gt = []
         subs = []
+        low_vram_blocks = bool(self.low_vram and not self.training)
+        if low_vram_blocks:
+            self._prepare_blocks_for_low_vram()
         for i, res in enumerate(self.blocks):
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
                     if self.pred_subdiv:
                         if self.training:
                             subs_gt.append(h.get_spatial_cache('subdivision'))
-                        h, sub = block(h)
+                        if low_vram_blocks:
+                            h, sub = self._run_block_low_vram(block, h)
+                        else:
+                            h, sub = block(h)
                         subs.append(sub)
                     else:
-                        h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
+                        subdiv = guide_subs[i] if guide_subs is not None else None
+                        if low_vram_blocks:
+                            h = self._run_block_low_vram(block, h, subdiv=subdiv)
+                        else:
+                            h = block(h, subdiv=subdiv)
                 else:
-                    h = block(h)
+                    if low_vram_blocks:
+                        h = self._run_block_low_vram(block, h)
+                    else:
+                        h = block(h)
         h = h.type(x.dtype)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
         h = self.output_layer(h)
@@ -511,12 +565,21 @@ class SparseUnetVaeDecoder(nn.Module):
         
         h = self.from_latent(x)
         h = h.type(self.dtype)
+        low_vram_blocks = bool(self.low_vram and not self.training)
+        if low_vram_blocks:
+            self._prepare_blocks_for_low_vram()
         for i, res in enumerate(self.blocks):
             if i == upsample_times:
                 return h.coords
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
-                    h, sub = block(h)
+                    if low_vram_blocks:
+                        h, sub = self._run_block_low_vram(block, h)
+                    else:
+                        h, sub = block(h)
                 else:
-                    h = block(h)
+                    if low_vram_blocks:
+                        h = self._run_block_low_vram(block, h)
+                    else:
+                        h = block(h)
        

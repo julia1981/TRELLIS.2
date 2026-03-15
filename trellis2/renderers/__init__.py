@@ -7,7 +7,7 @@ __attributes = {
     'EnvMap': 'pbr_mesh_renderer',
 }
 
-__submodules = []
+__submodules = ['drtk_compat']
 
 __all__ = list(__attributes.keys()) + __submodules
 
@@ -30,4 +30,5 @@ if __name__ == '__main__':
     from .mesh_renderer import MeshRenderer
     from .voxel_renderer import VoxelRenderer
     from .pbr_mesh_renderer import PbrMeshRenderer, EnvMap
+    from . import drtk_compat
     

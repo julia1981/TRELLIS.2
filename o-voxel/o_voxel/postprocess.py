@@ -3,12 +3,134 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import cv2
+import os
+import importlib
 from PIL import Image
 import trimesh
 import trimesh.visual
 from flex_gemm.ops.grid_sample import grid_sample_3d
-import nvdiffrast.torch as dr
 import cumesh
+
+
+def _resolve_raster_backend():
+    adapter = str(os.getenv("ML_TRELLIS2_RENDERER_ADAPTER", "") or "").strip().lower()
+    if adapter == "drtk":
+        return importlib.import_module("trellis2.renderers.drtk_compat")
+    try:
+        return importlib.import_module("nvdiffrast.torch")
+    except Exception:
+        return importlib.import_module("trellis2.renderers.drtk_compat")
+
+
+dr = _resolve_raster_backend()
+
+
+def _summarize_o3d_triangle_mesh(mesh_input, stage: str) -> dict:
+    summary = {"stage": stage}
+    try:
+        if hasattr(mesh_input, "read"):
+            vertices, faces = mesh_input.read()
+        elif hasattr(mesh_input, "vertices") and hasattr(mesh_input, "faces"):
+            vertices, faces = mesh_input.vertices, mesh_input.faces
+        else:
+            summary["reason"] = "unsupported_mesh_type"
+            summary["meshType"] = type(mesh_input).__name__
+            return summary
+
+        if torch.is_tensor(vertices):
+            vertices_np = vertices.detach().cpu().numpy()
+        else:
+            vertices_np = np.asarray(vertices)
+        if torch.is_tensor(faces):
+            faces_np = faces.detach().cpu().numpy()
+        else:
+            faces_np = np.asarray(faces)
+
+        vertices_np = np.asarray(vertices_np, dtype=np.float64)
+        faces_np = np.asarray(faces_np, dtype=np.int32)
+        summary["vertices"] = int(vertices_np.shape[0]) if vertices_np.ndim == 2 else 0
+        summary["faces"] = int(faces_np.shape[0]) if faces_np.ndim == 2 else 0
+        if summary["vertices"] <= 0 or summary["faces"] <= 0:
+            summary["reason"] = "empty_mesh"
+            return summary
+
+        trimesh_o3d = importlib.import_module("open3d")
+        o3d_mesh = trimesh_o3d.geometry.TriangleMesh()
+        o3d_mesh.vertices = trimesh_o3d.utility.Vector3dVector(vertices_np)
+        o3d_mesh.triangles = trimesh_o3d.utility.Vector3iVector(faces_np)
+        cluster_indices, _, _ = o3d_mesh.cluster_connected_triangles()
+        cluster_indices = np.asarray(cluster_indices, dtype=np.int64)
+        if cluster_indices.size > 0:
+            counts = np.bincount(cluster_indices)
+            summary["components"] = int(counts.shape[0])
+            summary["largestComponentFaces"] = int(counts.max())
+        else:
+            summary["components"] = 0
+            summary["largestComponentFaces"] = 0
+        return summary
+    except Exception as exc:
+        summary["error"] = str(exc)
+        return summary
+
+
+def _format_remesh_stage_block(summary: dict) -> str:
+    stage = str(summary.get("stage") or "unknown")
+    if "vertices" not in summary or "faces" not in summary:
+        reason = str(summary.get("reason") or summary.get("error") or "unavailable")
+        return f"Die neuen Remesh-Stufen:\n- `{stage}`\n  - `{reason}`"
+
+    vertices = int(summary.get("vertices") or 0)
+    faces = int(summary.get("faces") or 0)
+    components = int(summary.get("components") or 0)
+    largest_component_faces = int(summary.get("largestComponentFaces") or 0)
+    return (
+        "Die neuen Remesh-Stufen:\n"
+        f"- `{stage}`\n"
+        f"  - `{vertices:,}` Vertices\n"
+        f"  - `{faces:,}` Faces\n"
+        f"  - `{components:,}` Komponenten\n"
+        f"  - größte Komponente `{largest_component_faces:,}` Faces"
+    )
+
+
+def _resolve_postremesh_component_threshold() -> float:
+    raw = str(os.getenv("TRELLIS2_GLB_POSTREMESH_COMPONENT_THRESHOLD", "5e-5") or "").strip()
+    lowered = raw.lower()
+    if lowered in {"off", "disable", "disabled", "none"}:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        return 5e-5
+
+
+def _debug_dump_stage_mesh(mesh_input, stage: str) -> None:
+    dump_dir_raw = str(os.getenv("TRELLIS2_GLB_DEBUG_STAGE_DUMP_DIR", "") or "").strip()
+    if not dump_dir_raw:
+        return
+    try:
+        os.makedirs(dump_dir_raw, exist_ok=True)
+        if hasattr(mesh_input, "read"):
+            vertices, faces = mesh_input.read()
+        elif hasattr(mesh_input, "vertices") and hasattr(mesh_input, "faces"):
+            vertices, faces = mesh_input.vertices, mesh_input.faces
+        else:
+            return
+        if torch.is_tensor(vertices):
+            vertices = vertices.detach().cpu().numpy()
+        else:
+            vertices = np.asarray(vertices)
+        if torch.is_tensor(faces):
+            faces = faces.detach().cpu().numpy()
+        else:
+            faces = np.asarray(faces)
+        mesh = trimesh.Trimesh(vertices=np.asarray(vertices), faces=np.asarray(faces), process=False)
+        safe_stage = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stage)
+        out_path = os.path.join(dump_dir_raw, f"{safe_stage}.ply")
+        mesh.export(out_path)
+        print("[run-trellis-job] stage mesh dump written", {"stage": stage, "path": out_path})
+    except Exception as exc:
+        print("[run-trellis-job] warning: failed to dump stage mesh", {"stage": stage, "error": str(exc)})
 
 
 def to_glb(
@@ -144,11 +266,17 @@ def to_glb(
         mesh.fill_holes(max_hole_perimeter=3e-2)
         if verbose:
             print(f"After initial cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+        _stage_summary = _summarize_o3d_triangle_mesh(mesh, "after_remesh")
+        print("[run-trellis-job] trellis2 remesh stage", _stage_summary)
+        print(_format_remesh_stage_block(_stage_summary))
             
         # Step 3: Final simplification to target count
         mesh.simplify(decimation_target, verbose=verbose)
         if verbose:
             print(f"After final simplification: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+        _stage_summary = _summarize_o3d_triangle_mesh(mesh, "after_simplify")
+        print("[run-trellis-job] trellis2 remesh stage", _stage_summary)
+        print(_format_remesh_stage_block(_stage_summary))
         
         # Step 4: Final Cleanup loop
         mesh.remove_duplicate_faces()
@@ -157,6 +285,10 @@ def to_glb(
         mesh.fill_holes(max_hole_perimeter=3e-2)
         if verbose:
             print(f"After final cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+        _stage_summary = _summarize_o3d_triangle_mesh(mesh, "after_cleanup")
+        print("[run-trellis-job] trellis2 remesh stage", _stage_summary)
+        print(_format_remesh_stage_block(_stage_summary))
+        _debug_dump_stage_mesh(mesh, "after_cleanup")
             
         # Step 5: Unify face orientations
         mesh.unify_face_orientations()
@@ -185,6 +317,25 @@ def to_glb(
         mesh.simplify(decimation_target, verbose=verbose)
         if verbose:
             print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+
+        # Remeshing can leave duplicated faces, non-manifold edges and
+        # inconsistent winding. On Blackwell we also see many tiny shard
+        # components survive into UV unwrapping, which inflates vertex count
+        # without materially changing the visible surface. Apply a modest
+        # post-remesh component filter before UVs are generated.
+        postremesh_component_threshold = _resolve_postremesh_component_threshold()
+        mesh.remove_duplicate_faces()
+        mesh.repair_non_manifold_edges()
+        if postremesh_component_threshold > 0:
+            mesh.remove_small_connected_components(postremesh_component_threshold)
+        mesh.fill_holes(max_hole_perimeter=3e-2)
+        mesh.unify_face_orientations()
+        if verbose:
+            print(f"After remesh cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+        _stage_summary = _summarize_o3d_triangle_mesh(mesh, "after_cleanup")
+        print("[run-trellis-job] trellis2 remesh stage", _stage_summary)
+        print(_format_remesh_stage_block(_stage_summary))
+        _debug_dump_stage_mesh(mesh, "after_cleanup")
     
     if use_tqdm:
         pbar.update(1)
@@ -212,6 +363,10 @@ def to_glb(
     out_faces = out_faces.cuda()
     out_uvs = out_uvs.cuda()
     out_vmaps = out_vmaps.cuda()
+    _stage_summary = _summarize_o3d_triangle_mesh(type("_DebugMesh", (), {"vertices": out_vertices, "faces": out_faces})(), "after_uv_unwrap")
+    print("[run-trellis-job] trellis2 remesh stage", _stage_summary)
+    print(_format_remesh_stage_block(_stage_summary))
+    _debug_dump_stage_mesh(type("_DebugMesh", (), {"vertices": out_vertices, "faces": out_faces})(), "after_uv_unwrap")
     mesh.compute_vertex_normals()
     out_normals = mesh.read_vertex_normals()[out_vmaps]
     
@@ -257,13 +412,14 @@ def to_glb(
     
     # Trilinear sampling from the attribute volume (Color, Material props)
     attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
-    attrs[mask] = grid_sample_3d(
+    attrs_sampled = grid_sample_3d(
         attr_volume,
         torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
         shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
         grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
         mode='trilinear',
     )
+    attrs[mask] = attrs_sampled.to(dtype=attrs.dtype)
     if use_tqdm:
         pbar.update(1)
     if verbose:
