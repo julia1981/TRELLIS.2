@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +13,8 @@ __all__ = [
 class SparseLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias=True):
         super(SparseLinear, self).__init__(in_features, out_features, bias)
+        self._ai3d_diag_output_buffer: Optional[torch.Tensor] = None
+        self._ai3d_raw_marker_once_seen = set()
 
     def _ai3d_raw_marker(self, marker: str) -> None:
         if os.environ.get('AI3D_SPARSE_ATTN_RAW_MARKERS') != '1':
@@ -20,6 +23,12 @@ class SparseLinear(nn.Linear):
             os.write(2, f"[ai3d-raw] {marker}\n".encode('utf-8', errors='replace'))
         except Exception:
             pass
+
+    def _ai3d_raw_marker_once(self, key: str, marker: str) -> None:
+        if key in self._ai3d_raw_marker_once_seen:
+            return
+        self._ai3d_raw_marker_once_seen.add(key)
+        self._ai3d_raw_marker(marker)
 
     def _ai3d_linear_chunk_rows(self) -> int:
         raw = os.environ.get('AI3D_SPARSE_LINEAR_ROW_CHUNK', '').strip()
@@ -30,13 +39,41 @@ class SparseLinear(nn.Linear):
         except ValueError:
             return 0
 
+    def _ai3d_use_diag_output_buffer_fix(self) -> bool:
+        return (
+            os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+            and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
+            and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
+        )
+
     def forward(self, input: VarLenTensor) -> VarLenTensor:
         feats = input.feats
         row_chunk = self._ai3d_linear_chunk_rows()
 
         if row_chunk > 0 and feats.shape[0] > row_chunk:
             self._ai3d_raw_marker('pipeline_shape_slat_sparse_linear_before_output_alloc')
-            out_feats = feats.new_empty((feats.shape[0], self.out_features))
+            target_shape = (feats.shape[0], self.out_features)
+            out_feats = None
+            if self._ai3d_use_diag_output_buffer_fix():
+                self._ai3d_raw_marker('pipeline_shape_slat_sparse_linear_before_buffer_select')
+                candidate = self._ai3d_diag_output_buffer
+                if (
+                    candidate is not None
+                    and candidate.shape == target_shape
+                    and candidate.device == feats.device
+                    and candidate.dtype == feats.dtype
+                ):
+                    out_feats = candidate
+                    self._ai3d_raw_marker_once(
+                        'pipeline_shape_slat_sparse_linear_output_buffer_info',
+                        (
+                            'pipeline_shape_slat_sparse_linear_output_buffer='
+                            f'module_cache,shape:{target_shape},axis:0'
+                        ),
+                    )
+                self._ai3d_raw_marker('pipeline_shape_slat_sparse_linear_after_buffer_select')
+            if out_feats is None:
+                out_feats = feats.new_empty(target_shape)
             self._ai3d_raw_marker('pipeline_shape_slat_sparse_linear_after_output_alloc')
             for start in range(0, feats.shape[0], row_chunk):
                 end = min(start + row_chunk, feats.shape[0])
@@ -47,7 +84,10 @@ class SparseLinear(nn.Linear):
                 out_feats[start:end].copy_(chunk_out)
                 self._ai3d_raw_marker('pipeline_shape_slat_sparse_linear_after_result_access')
                 del chunk_out
-            return input.replace(out_feats)
+            out = input.replace(out_feats)
+            if self._ai3d_use_diag_output_buffer_fix():
+                self._ai3d_diag_output_buffer = out_feats
+            return out
 
         self._ai3d_raw_marker('pipeline_shape_slat_sparse_linear_before_mm')
         out_feats = super().forward(feats)
