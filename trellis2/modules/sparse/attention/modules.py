@@ -88,6 +88,14 @@ def _ai3d_use_diag_texture_self_attn_q_rms_norm_fix() -> bool:
     )
 
 
+def _ai3d_use_diag_texture_self_attn_k_rms_norm_fix() -> bool:
+    return (
+        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
+    )
+
+
 def _ai3d_use_diag_cross_attn_to_q_fix() -> bool:
     return (
         os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
@@ -133,7 +141,10 @@ class SparseMultiHeadRMSNorm(nn.Module):
         row_chunk: int = 0,
     ) -> Union[VarLenTensor, torch.Tensor]:
         def _maybe_emit_varlen_chunk_plan(feats: torch.Tensor) -> None:
-            if marker_prefix != 'pipeline_tex_slat_self_attn_q_rms_norm':
+            if marker_prefix not in {
+                'pipeline_tex_slat_self_attn_q_rms_norm',
+                'pipeline_tex_slat_self_attn_k_rms_norm',
+            }:
                 return
             shape_tuple = tuple(int(v) for v in feats.shape)
             token_axis = 0
@@ -455,7 +466,11 @@ class SparseMultiHeadAttention(nn.Module):
                         marker_prefix='pipeline_tex_slat_self_attn_q_rms_norm',
                         row_chunk=_ai3d_linear_row_chunk() if _ai3d_use_diag_texture_self_attn_q_rms_norm_fix() else 0,
                     )
-                    k = self.k_rms_norm(k)
+                    k = self.k_rms_norm(
+                        k,
+                        marker_prefix='pipeline_tex_slat_self_attn_k_rms_norm',
+                        row_chunk=_ai3d_linear_row_chunk() if _ai3d_use_diag_texture_self_attn_k_rms_norm_fix() else 0,
+                    )
                 if self.use_rope:
                     q, k = self.rope(q, k)
                 _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_q_feats')
