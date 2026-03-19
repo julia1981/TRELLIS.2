@@ -80,6 +80,14 @@ def _ai3d_use_diag_self_attn_to_qkv_fix() -> bool:
     )
 
 
+def _ai3d_use_diag_texture_self_attn_q_rms_norm_fix() -> bool:
+    return (
+        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
+    )
+
+
 def _ai3d_use_diag_cross_attn_to_q_fix() -> bool:
     return (
         os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
@@ -124,6 +132,31 @@ class SparseMultiHeadRMSNorm(nn.Module):
         cast_to_float: bool = True,
         row_chunk: int = 0,
     ) -> Union[VarLenTensor, torch.Tensor]:
+        def _maybe_emit_varlen_chunk_plan(feats: torch.Tensor) -> None:
+            if marker_prefix != 'pipeline_tex_slat_self_attn_q_rms_norm':
+                return
+            shape_tuple = tuple(int(v) for v in feats.shape)
+            token_axis = 0
+            _ai3d_raw_marker_once(
+                f'{marker_prefix}_cast_plan',
+                (
+                    f'{marker_prefix}_cast_plan='
+                    f'cast_to_float:{int(cast_to_float)},shape:{shape_tuple},token_axis:{token_axis}'
+                ),
+            )
+            if row_chunk > 0 and feats.shape[token_axis] > row_chunk:
+                token_len = int(feats.shape[token_axis])
+                num_chunks = math.ceil(token_len / row_chunk)
+                first_end = min(row_chunk, token_len)
+                last_start = ((token_len - 1) // row_chunk) * row_chunk
+                _ai3d_raw_marker_once(
+                    f'{marker_prefix}_chunk_ranges',
+                    (
+                        f'{marker_prefix}_chunk_ranges='
+                        f'count:{num_chunks},first:0:{first_end},last:{last_start}:{token_len}'
+                    ),
+                )
+
         def _diag_token_axis(feats: torch.Tensor) -> int:
             if feats.ndim >= 4:
                 return 1
@@ -160,31 +193,55 @@ class SparseMultiHeadRMSNorm(nn.Module):
 
         x_type = x.dtype
         if isinstance(x, VarLenTensor):
-            feats = x.feats.float() if cast_to_float else x.feats
-            _ai3d_raw_marker(f'{marker_prefix}_before_normalize')
+            feats = x.feats
+            _maybe_emit_varlen_chunk_plan(feats)
             if row_chunk > 0 and feats.shape[0] > row_chunk:
+                gamma = self.gamma
                 _ai3d_raw_marker(f'{marker_prefix}_before_first_chunk')
                 for start in range(0, feats.shape[0], row_chunk):
                     end = min(start + row_chunk, feats.shape[0])
-                    normalized_chunk = F.normalize(feats[start:end], dim=-1)
-                    feats[start:end].copy_(normalized_chunk)
-                    del normalized_chunk
+                    chunk = feats[start:end]
+                    _ai3d_raw_marker(f'{marker_prefix}_before_cast')
+                    work_chunk = chunk.float() if cast_to_float else chunk
+                    _ai3d_raw_marker(f'{marker_prefix}_after_cast')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_normalize')
+                    work_chunk = F.normalize(work_chunk, dim=-1)
+                    _ai3d_raw_marker(f'{marker_prefix}_after_normalize')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_normalized_result_access')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_gamma_mul')
+                    if gamma.dtype != work_chunk.dtype:
+                        gamma = gamma.to(dtype=work_chunk.dtype)
+                    work_chunk.mul_(gamma)
+                    _ai3d_raw_marker(f'{marker_prefix}_after_gamma_mul')
+                    _ai3d_raw_marker(f'{marker_prefix}_after_normalized_result_access')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_scale_mul')
+                    work_chunk.mul_(self.scale)
+                    _ai3d_raw_marker(f'{marker_prefix}_after_scale_mul')
+                    if work_chunk.dtype != feats.dtype:
+                        work_chunk = work_chunk.to(dtype=feats.dtype)
+                    feats[start:end].copy_(work_chunk)
+                    del work_chunk
                 _ai3d_raw_marker(f'{marker_prefix}_after_last_chunk')
+                x = x.replace(feats)
             else:
+                _ai3d_raw_marker(f'{marker_prefix}_before_cast')
+                feats = feats.float() if cast_to_float else feats
+                _ai3d_raw_marker(f'{marker_prefix}_after_cast')
+                _ai3d_raw_marker(f'{marker_prefix}_before_normalize')
                 feats = F.normalize(feats, dim=-1)
-            _ai3d_raw_marker(f'{marker_prefix}_after_normalize')
-            _ai3d_raw_marker(f'{marker_prefix}_before_normalized_result_access')
-            _ai3d_raw_marker(f'{marker_prefix}_before_gamma_mul')
-            gamma = self.gamma
-            if gamma.dtype != feats.dtype:
-                gamma = gamma.to(dtype=feats.dtype)
-            feats.mul_(gamma)
-            _ai3d_raw_marker(f'{marker_prefix}_after_gamma_mul')
-            _ai3d_raw_marker(f'{marker_prefix}_after_normalized_result_access')
-            _ai3d_raw_marker(f'{marker_prefix}_before_scale_mul')
-            feats.mul_(self.scale)
-            _ai3d_raw_marker(f'{marker_prefix}_after_scale_mul')
-            x = x.replace(feats)
+                _ai3d_raw_marker(f'{marker_prefix}_after_normalize')
+                _ai3d_raw_marker(f'{marker_prefix}_before_normalized_result_access')
+                _ai3d_raw_marker(f'{marker_prefix}_before_gamma_mul')
+                gamma = self.gamma
+                if gamma.dtype != feats.dtype:
+                    gamma = gamma.to(dtype=feats.dtype)
+                feats.mul_(gamma)
+                _ai3d_raw_marker(f'{marker_prefix}_after_gamma_mul')
+                _ai3d_raw_marker(f'{marker_prefix}_after_normalized_result_access')
+                _ai3d_raw_marker(f'{marker_prefix}_before_scale_mul')
+                feats.mul_(self.scale)
+                _ai3d_raw_marker(f'{marker_prefix}_after_scale_mul')
+                x = x.replace(feats)
         else:
             feats = x.float() if cast_to_float else x
             effective_chunk_axis = _diag_token_axis(feats)
@@ -393,7 +450,11 @@ class SparseMultiHeadAttention(nn.Module):
             if self.qk_rms_norm or self.use_rope:
                 q, k, v = qkv.unbind(dim=-3)
                 if self.qk_rms_norm:
-                    q = self.q_rms_norm(q)
+                    q = self.q_rms_norm(
+                        q,
+                        marker_prefix='pipeline_tex_slat_self_attn_q_rms_norm',
+                        row_chunk=_ai3d_linear_row_chunk() if _ai3d_use_diag_texture_self_attn_q_rms_norm_fix() else 0,
+                    )
                     k = self.k_rms_norm(k)
                 if self.use_rope:
                     q, k = self.rope(q, k)
