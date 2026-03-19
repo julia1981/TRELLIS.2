@@ -101,6 +101,14 @@ def _use_diag_nonflash_self_attn_recombine_fix() -> bool:
     )
 
 
+def _use_diag_nonflash_self_attn_output_buffer_fix() -> bool:
+    return (
+        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
+    )
+
+
 def _diag_nonflash_q_chunk_size() -> int:
     raw = os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK', '').strip()
     if raw == '':
@@ -158,12 +166,26 @@ def _nonflash_math_sdp_context():
 
 def _run_diag_nonflash_self_attn(qkv: torch.Tensor, q_seqlen: Sequence[int]) -> torch.Tensor:
     _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_entered')
-    out = torch.empty_like(qkv[:, 0])
+    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_alloc')
+    if _use_diag_nonflash_self_attn_output_buffer_fix():
+        out = qkv[:, 0]
+        _ai3d_raw_marker_once(
+            'pipeline_shape_slat_self_attn_nonflash_output_buffer_info',
+            (
+                'pipeline_shape_slat_self_attn_nonflash_output_buffer='
+                f'reused,shape:{tuple(int(v) for v in out.shape)},axis:0'
+            ),
+        )
+    else:
+        out = torch.empty_like(qkv[:, 0])
+    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_alloc')
     _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_kernel')
     offset = 0
     chunk_size = _diag_nonflash_q_chunk_size()
     kv_chunk_size = _diag_nonflash_kv_chunk_size()
     use_recombine_fix = _use_diag_nonflash_self_attn_recombine_fix()
+    emitted_first_output_write = False
+    emitted_any_output_write = False
     with _nonflash_math_sdp_context():
         for length in q_seqlen:
             next_offset = offset + length
@@ -219,7 +241,11 @@ def _run_diag_nonflash_self_attn(qkv: torch.Tensor, q_seqlen: Sequence[int]) -> 
                         out_target = out[offset + q_start:offset + q_end].permute(1, 0, 2)
                         _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_target_permute')
                         _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_recombine')
+                        if not emitted_first_output_write:
+                            _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_first_output_write')
+                            emitted_first_output_write = True
                         out_target.copy_(out_chunk[0])
+                        emitted_any_output_write = True
                         _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_recombine')
                         del out_target
                     else:
@@ -233,7 +259,11 @@ def _run_diag_nonflash_self_attn(qkv: torch.Tensor, q_seqlen: Sequence[int]) -> 
                         out_chunk = out_chunk.contiguous()
                         _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_contiguous')
                         _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_recombine')
+                        if not emitted_first_output_write:
+                            _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_first_output_write')
+                            emitted_first_output_write = True
                         out[offset + q_start:offset + q_end].copy_(out_chunk)
+                        emitted_any_output_write = True
                         _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_recombine')
                     del out_chunk
             else:
@@ -250,7 +280,11 @@ def _run_diag_nonflash_self_attn(qkv: torch.Tensor, q_seqlen: Sequence[int]) -> 
                     out_target = out[offset:next_offset].permute(1, 0, 2)
                     _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_target_permute')
                     _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_recombine')
+                    if not emitted_first_output_write:
+                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_first_output_write')
+                        emitted_first_output_write = True
                     out_target.copy_(out_chunk[0])
+                    emitted_any_output_write = True
                     _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_recombine')
                     del out_target
                 else:
@@ -264,11 +298,20 @@ def _run_diag_nonflash_self_attn(qkv: torch.Tensor, q_seqlen: Sequence[int]) -> 
                     out_chunk = out_chunk.contiguous()
                     _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_contiguous')
                     _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_recombine')
+                    if not emitted_first_output_write:
+                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_first_output_write')
+                        emitted_first_output_write = True
                     out[offset:next_offset].copy_(out_chunk)
+                    emitted_any_output_write = True
                     _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_recombine')
                 del out_chunk
             offset = next_offset
+    if emitted_any_output_write:
+        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_last_output_write')
     _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_kernel')
+    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_result_access')
+    _ = out.shape
+    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_result_access')
     return out
 
 
