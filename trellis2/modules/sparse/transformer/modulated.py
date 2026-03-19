@@ -1,3 +1,4 @@
+import os
 from typing import *
 import torch
 import torch.nn as nn
@@ -5,6 +6,120 @@ from ..basic import VarLenTensor, SparseTensor
 from ..attention import SparseMultiHeadAttention
 from ...norm import LayerNorm32
 from .blocks import SparseFeedForwardNet
+
+
+def _ai3d_raw_marker(marker: str) -> None:
+    if os.environ.get('AI3D_SPARSE_ATTN_RAW_MARKERS') != '1':
+        return
+    try:
+        os.write(2, f"[ai3d-raw] {marker}\n".encode('utf-8', errors='replace'))
+    except Exception:
+        pass
+
+
+def _ai3d_use_diag_cross_modulation_fix() -> bool:
+    return (
+        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') in {'64', '128'}
+    )
+
+
+def _ai3d_use_diag_cross_residual_add_fix() -> bool:
+    return (
+        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
+    )
+
+
+def _ai3d_use_diag_cross_mlp_modulation_fix() -> bool:
+    return (
+        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
+    )
+
+
+def _ai3d_apply_diag_cross_modulation(
+    h: SparseTensor,
+    scale_msa: torch.Tensor,
+    shift_msa: torch.Tensor,
+) -> SparseTensor:
+    feats = h.feats
+    batch_map = h.batch_boardcast_map
+
+    scale_rows = scale_msa if scale_msa.dtype == feats.dtype else scale_msa.to(dtype=feats.dtype)
+    shift_rows = shift_msa if shift_msa.dtype == feats.dtype else shift_msa.to(dtype=feats.dtype)
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_modulation_before_one_plus_scale')
+    scale_rows = scale_rows[batch_map]
+    scale_rows.add_(1)
+    _ai3d_raw_marker('pipeline_shape_slat_cross_modulation_after_one_plus_scale')
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_modulation_before_mul')
+    feats.mul_(scale_rows)
+    _ai3d_raw_marker('pipeline_shape_slat_cross_modulation_after_mul')
+    del scale_rows
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_modulation_before_shift_add')
+    feats.add_(shift_rows[batch_map])
+    _ai3d_raw_marker('pipeline_shape_slat_cross_modulation_after_shift_add')
+    return h
+
+
+def _ai3d_apply_diag_cross_residual_add(x: SparseTensor, h: SparseTensor) -> SparseTensor:
+    _ai3d_raw_marker('pipeline_shape_slat_cross_residual_add_before_add')
+    feats = x.feats
+    h_feats = h.feats
+    if h_feats.dtype != feats.dtype:
+        h_feats = h_feats.to(dtype=feats.dtype)
+    feats.add_(h_feats)
+    _ai3d_raw_marker('pipeline_shape_slat_cross_residual_add_after_add')
+
+    result = x.replace(feats)
+    _ai3d_raw_marker('pipeline_shape_slat_cross_residual_add_before_result_access')
+    _ = result.feats
+    _ai3d_raw_marker('pipeline_shape_slat_cross_residual_add_after_result_access')
+    return result
+
+
+def _ai3d_apply_diag_cross_mlp_modulation(
+    h: SparseTensor,
+    scale_mlp: torch.Tensor,
+    shift_mlp: torch.Tensor,
+) -> SparseTensor:
+    feats = h.feats
+    batch_map = h.batch_boardcast_map
+
+    scale_rows = scale_mlp if scale_mlp.dtype == feats.dtype else scale_mlp.to(dtype=feats.dtype)
+    shift_rows = shift_mlp if shift_mlp.dtype == feats.dtype else shift_mlp.to(dtype=feats.dtype)
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_before_scale_materialize')
+    scale_rows = scale_rows[batch_map]
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_after_scale_materialize')
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_before_one_plus_scale')
+    scale_rows.add_(1)
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_after_one_plus_scale')
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_before_mul')
+    feats.mul_(scale_rows)
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_after_mul')
+    del scale_rows
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_before_shift_materialize')
+    shift_rows = shift_rows[batch_map]
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_after_shift_materialize')
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_before_shift_add')
+    feats.add_(shift_rows)
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_after_shift_add')
+    del shift_rows
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_before_result_access')
+    _ = h.feats
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_after_result_access')
+    return h
 
 
 class ModulatedSparseTransformerBlock(nn.Module):
@@ -145,15 +260,26 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(mod).chunk(6, dim=1)
         h = x.replace(self.norm1(x.feats))
-        h = h * (1 + scale_msa) + shift_msa
+        if _ai3d_use_diag_cross_modulation_fix():
+            h = _ai3d_apply_diag_cross_modulation(h, scale_msa, shift_msa)
+        else:
+            h = h * (1 + scale_msa) + shift_msa
         h = self.self_attn(h)
         h = h * gate_msa
         x = x + h
         h = x.replace(self.norm2(x.feats))
         h = self.cross_attn(h, context)
-        x = x + h
+        if _ai3d_use_diag_cross_residual_add_fix():
+            x = _ai3d_apply_diag_cross_residual_add(x, h)
+        else:
+            x = x + h
+        _ai3d_raw_marker('pipeline_shape_slat_norm3_before_call')
         h = x.replace(self.norm3(x.feats))
-        h = h * (1 + scale_mlp) + shift_mlp
+        _ai3d_raw_marker('pipeline_shape_slat_norm3_after_call')
+        if _ai3d_use_diag_cross_mlp_modulation_fix():
+            h = _ai3d_apply_diag_cross_mlp_modulation(h, scale_mlp, shift_mlp)
+        else:
+            h = h * (1 + scale_mlp) + shift_mlp
         h = self.mlp(h)
         h = h * gate_mlp
         x = x + h

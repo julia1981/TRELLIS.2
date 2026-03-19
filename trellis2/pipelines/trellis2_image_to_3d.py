@@ -404,6 +404,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             sampler_params (dict): Additional parameters for the sampler.
         """
         # Sample structured latent
+        emit_timing = getattr(self, "_ai3d_emit_timing", None)
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(shape_slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(shape_slat.device)
         shape_slat = (shape_slat - mean) / std
@@ -411,6 +412,37 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         in_channels = flow_model.in_channels if isinstance(flow_model, nn.Module) else flow_model[0].in_channels
         noise = shape_slat.replace(feats=torch.randn(shape_slat.coords.shape[0], in_channels - shape_slat.feats.shape[1]).to(self.device))
         sampler_params = {**self.tex_slat_sampler_params, **sampler_params}
+        force_no_tqdm = bool(getattr(self, "_ai3d_force_tex_slat_no_tqdm", False))
+        sampler_disable_tqdm = bool(getattr(self.tex_slat_sampler, "_ai3d_disable_tqdm", False))
+        disable_tqdm = force_no_tqdm or sampler_disable_tqdm
+        sample_verbose = not disable_tqdm
+        if callable(emit_timing):
+            try:
+                emit_timing(
+                    "pipeline_tex_slat_callsite_verbose_resolved",
+                    0,
+                    {
+                        "forceNoTqdm": force_no_tqdm,
+                        "samplerDisableTqdm": sampler_disable_tqdm,
+                        "sampleVerbose": sample_verbose,
+                        "samplerClass": type(self.tex_slat_sampler).__name__,
+                    },
+                )
+            except Exception:
+                pass
+        if disable_tqdm:
+            try:
+                print(
+                    "[ai3d] tex_slat_callsite_verbose_forced",
+                    {
+                        "forceNoTqdm": force_no_tqdm,
+                        "samplerDisableTqdm": sampler_disable_tqdm,
+                        "sampleVerbose": sample_verbose,
+                        "samplerClass": type(self.tex_slat_sampler).__name__,
+                    },
+                )
+            except Exception:
+                pass
         if self.low_vram:
             flow_model.to(self.device)
         slat = self.tex_slat_sampler.sample(
@@ -419,16 +451,76 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             concat_cond=shape_slat,
             **cond,
             **sampler_params,
-            verbose=True,
+            verbose=sample_verbose,
             tqdm_desc="Sampling texture SLat",
         ).samples
+        if callable(emit_timing):
+            try:
+                emit_timing(
+                    "pipeline_tex_slat_internal_samples_ready",
+                    0,
+                    {
+                        "device": str(getattr(slat, "device", "unknown")),
+                        "shape": tuple(int(v) for v in getattr(slat, "shape", ())),
+                        "featureShape": tuple(int(v) for v in getattr(getattr(slat, "feats", None), "shape", ())),
+                    },
+                )
+            except Exception:
+                pass
+        try:
+            del noise
+        except Exception:
+            pass
+        try:
+            del shape_slat
+        except Exception:
+            pass
         if self.low_vram:
             flow_model.cpu()
+            if callable(emit_timing):
+                try:
+                    emit_timing("pipeline_tex_slat_internal_flow_model_offload", 0)
+                except Exception:
+                    pass
 
         std = torch.tensor(self.tex_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(slat.device)
-        slat = slat * std + mean
+        if callable(emit_timing):
+            try:
+                emit_timing(
+                    "pipeline_tex_slat_internal_norm_stats_ready",
+                    0,
+                    {
+                        "device": str(getattr(std, "device", "unknown")),
+                        "shape": tuple(int(v) for v in getattr(std, "shape", ())),
+                    },
+                )
+            except Exception:
+                pass
+        slat_feats = getattr(slat, "feats", None)
+        if torch.is_tensor(slat_feats):
+            slat_feats.mul_(std).add_(mean)
+        else:
+            slat = slat * std + mean
+        if callable(emit_timing):
+            try:
+                emit_timing(
+                    "pipeline_tex_slat_internal_denorm_ready",
+                    0,
+                    {
+                        "device": str(getattr(slat, "device", "unknown")),
+                        "shape": tuple(int(v) for v in getattr(slat, "shape", ())),
+                        "featureShape": tuple(int(v) for v in getattr(getattr(slat, "feats", None), "shape", ())),
+                    },
+                )
+            except Exception:
+                pass
         
+        if callable(emit_timing):
+            try:
+                emit_timing("pipeline_tex_slat_internal_return_ready", 0)
+            except Exception:
+                pass
         return slat
 
     def decode_tex_slat(
