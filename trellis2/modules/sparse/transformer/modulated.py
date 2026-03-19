@@ -40,6 +40,14 @@ def _ai3d_use_diag_cross_mlp_modulation_fix() -> bool:
     )
 
 
+def _ai3d_use_diag_cross_mlp_residual_add_fix() -> bool:
+    return (
+        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
+    )
+
+
 def _ai3d_apply_diag_cross_modulation(
     h: SparseTensor,
     scale_msa: torch.Tensor,
@@ -120,6 +128,28 @@ def _ai3d_apply_diag_cross_mlp_modulation(
     _ = h.feats
     _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_modulation_after_result_access')
     return h
+
+
+def _ai3d_apply_diag_cross_mlp_residual_add(x: SparseTensor, h: SparseTensor) -> SparseTensor:
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_residual_add_before_target_buffer_prepare')
+    feats = x.feats
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_residual_add_after_target_buffer_prepare')
+
+    h_feats = h.feats
+    if h_feats.dtype != feats.dtype:
+        h_feats = h_feats.to(dtype=feats.dtype)
+
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_residual_add_before_add')
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_residual_add_before_inplace_add')
+    feats.add_(h_feats)
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_residual_add_after_inplace_add')
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_residual_add_after_add')
+
+    result = x.replace(feats)
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_residual_add_before_result_access')
+    _ = result.feats
+    _ai3d_raw_marker('pipeline_shape_slat_cross_mlp_residual_add_after_result_access')
+    return result
 
 
 class ModulatedSparseTransformerBlock(nn.Module):
@@ -282,7 +312,10 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
             h = h * (1 + scale_mlp) + shift_mlp
         h = self.mlp(h)
         h = h * gate_mlp
-        x = x + h
+        if _ai3d_use_diag_cross_mlp_residual_add_fix():
+            x = _ai3d_apply_diag_cross_mlp_residual_add(x, h)
+        else:
+            x = x + h
         return x
 
     def forward(self, x: SparseTensor, mod: torch.Tensor, context: Union[torch.Tensor, VarLenTensor]) -> SparseTensor:
