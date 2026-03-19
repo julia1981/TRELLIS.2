@@ -20,6 +20,7 @@ __all__ = [
 
 
 _AI3D_RAW_MARKER_ONCE = set()
+_AI3D_SHARED_OUTPUT_BUFFERS: dict[tuple[str, str, str], torch.Tensor] = {}
 
 
 def ai3d_raw_marker(marker: str) -> None:
@@ -36,6 +37,10 @@ def ai3d_raw_marker_once(key: str, marker: str) -> None:
         return
     _AI3D_RAW_MARKER_ONCE.add(key)
     ai3d_raw_marker(marker)
+
+
+def _shared_buffer_key(marker_prefix: str, like: torch.Tensor) -> tuple[str, str, str]:
+    return marker_prefix, str(like.device), str(like.dtype)
 
 
 def ai3d_linear_row_chunk() -> int:
@@ -89,16 +94,23 @@ def _matching_buffer(
     *,
     target_shape: tuple[int, ...],
     like: torch.Tensor,
-) -> Optional[torch.Tensor]:
+) -> tuple[Optional[torch.Tensor], str]:
     if candidate is None:
-        return None
-    if candidate.shape != target_shape:
-        return None
+        return None, "missing"
     if candidate.device != like.device:
-        return None
+        return None, "device_mismatch"
     if candidate.dtype != like.dtype:
-        return None
-    return candidate
+        return None, "dtype_mismatch"
+    if candidate.shape == target_shape:
+        return candidate, "exact"
+    target_numel = 1
+    for dim in target_shape:
+        target_numel *= int(dim)
+    if candidate.numel() < target_numel:
+        return None, f"shape_mismatch_numel_too_small:{tuple(int(v) for v in candidate.shape)}"
+    if not candidate.is_contiguous():
+        return None, "shape_mismatch_noncontiguous"
+    return candidate.reshape(-1)[:target_numel].view(target_shape), "capacity_reuse"
 
 
 def _acquire_output_buffer(
@@ -108,15 +120,73 @@ def _acquire_output_buffer(
     output_buffer: Optional[torch.Tensor],
     buffer_owner: Optional[object],
     cache_attr: str,
+    marker_prefix: Optional[str] = None,
 ) -> tuple[torch.Tensor, bool]:
-    matched = _matching_buffer(output_buffer, target_shape=target_shape, like=like)
+    matched, output_reason = _matching_buffer(output_buffer, target_shape=target_shape, like=like)
     if matched is not None:
+        if marker_prefix is not None:
+            ai3d_raw_marker_once(
+                f"{marker_prefix}_output_buffer_resolution",
+                (
+                    f"{marker_prefix}_output_buffer_resolution="
+                    f"owner:direct_output_buffer,target_shape:{tuple(int(v) for v in target_shape)},"
+                    f"like_shape:{tuple(int(v) for v in like.shape)},cache_present:0,reuse_mode:{output_reason}"
+                ),
+            )
         return matched, True
 
+    cached_candidate = None
     if buffer_owner is not None:
-        cached = _matching_buffer(getattr(buffer_owner, cache_attr, None), target_shape=target_shape, like=like)
+        cached_candidate = getattr(buffer_owner, cache_attr, None)
+        cached, cache_reason = _matching_buffer(cached_candidate, target_shape=target_shape, like=like)
         if cached is not None:
+            if marker_prefix is not None:
+                ai3d_raw_marker_once(
+                    f"{marker_prefix}_output_buffer_resolution",
+                    (
+                        f"{marker_prefix}_output_buffer_resolution="
+                        f"owner:{type(buffer_owner).__name__},target_shape:{tuple(int(v) for v in target_shape)},"
+                        f"like_shape:{tuple(int(v) for v in like.shape)},cache_present:1,reuse_mode:{cache_reason}"
+                    ),
+                )
             return cached, True
+    else:
+        cache_reason = "no_buffer_owner"
+
+    shared_candidate = None
+    if marker_prefix is not None and ai3d_use_5070ti_quality_path():
+        shared_candidate = _AI3D_SHARED_OUTPUT_BUFFERS.get(_shared_buffer_key(marker_prefix, like))
+        shared, shared_reason = _matching_buffer(shared_candidate, target_shape=target_shape, like=like)
+        if shared is not None:
+            ai3d_raw_marker_once(
+                f"{marker_prefix}_shared_output_buffer_resolution_{id(shared_candidate)}",
+                (
+                    f"{marker_prefix}_output_buffer_resolution="
+                    f"owner:shared_marker_cache,target_shape:{tuple(int(v) for v in target_shape)},"
+                    f"like_shape:{tuple(int(v) for v in like.shape)},cache_present:1,reuse_mode:{shared_reason}"
+                ),
+            )
+            return shared, True
+    else:
+        shared_reason = "shared_cache_disabled"
+
+    if marker_prefix is not None:
+        ai3d_raw_marker_once(
+            f"{marker_prefix}_output_buffer_resolution_{id(buffer_owner) if buffer_owner is not None else 'none'}",
+            (
+                f"{marker_prefix}_output_buffer_resolution="
+                f"owner:{type(buffer_owner).__name__ if buffer_owner is not None else 'none'},"
+                f"target_shape:{tuple(int(v) for v in target_shape)},"
+                f"like_shape:{tuple(int(v) for v in like.shape)},"
+                f"output_buffer_present:{int(output_buffer is not None)},"
+                f"output_buffer_reason:{output_reason},"
+                f"cache_present:{int(cached_candidate is not None)},"
+                f"cache_reason:{cache_reason},"
+                f"shared_cache_present:{int(shared_candidate is not None)},"
+                f"shared_cache_reason:{shared_reason},"
+                f"fallback:new_empty"
+            ),
+        )
 
     return like.new_empty(target_shape), False
 
@@ -124,7 +194,25 @@ def _acquire_output_buffer(
 def _remember_output_buffer(buffer_owner: Optional[object], cache_attr: str, tensor: torch.Tensor) -> None:
     if buffer_owner is None:
         return
+    existing = getattr(buffer_owner, cache_attr, None)
+    if (
+        isinstance(existing, torch.Tensor)
+        and existing.device == tensor.device
+        and existing.dtype == tensor.dtype
+        and existing.numel() >= tensor.numel()
+    ):
+        return
     setattr(buffer_owner, cache_attr, tensor)
+
+
+def _remember_shared_output_buffer(marker_prefix: Optional[str], tensor: torch.Tensor) -> None:
+    if marker_prefix is None or not ai3d_use_5070ti_quality_path():
+        return
+    key = _shared_buffer_key(marker_prefix, tensor)
+    existing = _AI3D_SHARED_OUTPUT_BUFFERS.get(key)
+    if existing is not None and existing.numel() >= tensor.numel():
+        return
+    _AI3D_SHARED_OUTPUT_BUFFERS[key] = tensor
 
 
 def chunked_linear(
@@ -158,6 +246,7 @@ def chunked_linear(
             output_buffer=output_buffer,
             buffer_owner=buffer_owner,
             cache_attr=cache_attr,
+            marker_prefix=marker_prefix,
         )
         if reused and marker_prefix is not None and marker_style == "attention":
             ai3d_raw_marker_once(
@@ -202,6 +291,7 @@ def chunked_linear(
             ai3d_raw_marker(f"{marker_prefix}_before_result_access")
 
     _remember_output_buffer(buffer_owner, cache_attr, out_feats)
+    _remember_shared_output_buffer(marker_prefix, out_feats)
     result = x.replace(out_feats) if is_varlen else out_feats
 
     if marker_prefix is not None:
