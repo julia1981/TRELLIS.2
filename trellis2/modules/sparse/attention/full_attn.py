@@ -5,6 +5,7 @@ from typing import *
 import torch
 from .. import VarLenTensor
 from .. import config
+from ..linear import ai3d_use_5070ti_quality_path
 
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
 
 
 _AI3D_RAW_MARKER_ONCE = set()
+_AI3D_ATTENTION_OUTPUT_BUFFERS: Dict[Tuple[str, str, str], torch.Tensor] = {}
 
 
 def _ai3d_raw_marker(marker: str) -> None:
@@ -29,6 +31,199 @@ def _ai3d_raw_marker_once(key: str, marker: str) -> None:
         return
     _AI3D_RAW_MARKER_ONCE.add(key)
     _ai3d_raw_marker(marker)
+
+
+def _attention_output_buffer_key(marker_prefix: str, like: torch.Tensor) -> Tuple[str, str, str]:
+    return marker_prefix, str(like.device), str(like.dtype)
+
+
+def _matching_attention_output_buffer(
+    candidate: Optional[torch.Tensor],
+    *,
+    target_shape: Tuple[int, ...],
+    like: torch.Tensor,
+) -> Tuple[Optional[torch.Tensor], str]:
+    if candidate is None:
+        return None, 'missing'
+    if candidate.device != like.device:
+        return None, 'device_mismatch'
+    if candidate.dtype != like.dtype:
+        return None, 'dtype_mismatch'
+    if candidate.shape == target_shape:
+        return candidate, 'exact'
+    target_numel = 1
+    for dim in target_shape:
+        target_numel *= int(dim)
+    if candidate.numel() < target_numel:
+        return None, f'shape_mismatch_numel_too_small:{tuple(int(v) for v in candidate.shape)}'
+    if not candidate.is_contiguous():
+        return None, 'shape_mismatch_noncontiguous'
+    return candidate.reshape(-1)[:target_numel].view(target_shape), 'capacity_reuse'
+
+
+def _get_attention_output_cache(scratch_owner: Optional[object]) -> Optional[dict]:
+    if scratch_owner is None:
+        return None
+    cache = getattr(scratch_owner, '_ai3d_attention_output_buffers', None)
+    if cache is None:
+        cache = {}
+        setattr(scratch_owner, '_ai3d_attention_output_buffers', cache)
+    return cache
+
+
+def _acquire_attention_output_buffer(
+    like: torch.Tensor,
+    *,
+    marker_prefix: str,
+    target_shape: Tuple[int, ...],
+    output_buffer: Optional[torch.Tensor],
+    scratch_owner: Optional[object],
+    write_axis: int = 0,
+) -> Tuple[torch.Tensor, str]:
+    matched, output_reason = _matching_attention_output_buffer(
+        output_buffer,
+        target_shape=target_shape,
+        like=like,
+    )
+    if matched is not None:
+        _ai3d_raw_marker_once(
+            f'{marker_prefix}_output_buffer_resolution',
+            (
+                f'{marker_prefix}_output_buffer_resolution='
+                f'owner:direct_output_buffer,target_shape:{tuple(int(v) for v in target_shape)},'
+                f'like_shape:{tuple(int(v) for v in like.shape)},reuse_mode:{output_reason}'
+            ),
+        )
+        _ai3d_raw_marker_once(
+            f'{marker_prefix}_output_buffer_info',
+            (
+                f'{marker_prefix}_output_buffer='
+                f'reused,shape:{tuple(int(v) for v in matched.shape)},axis:{int(write_axis)}'
+            ),
+        )
+        return matched, 'direct_output_buffer'
+
+    owner_cache = _get_attention_output_cache(scratch_owner)
+    owner_candidate = None if owner_cache is None else owner_cache.get(_attention_output_buffer_key(marker_prefix, like))
+    owner_matched, owner_reason = _matching_attention_output_buffer(
+        owner_candidate,
+        target_shape=target_shape,
+        like=like,
+    )
+    if owner_matched is not None:
+        _ai3d_raw_marker_once(
+            f'{marker_prefix}_output_buffer_resolution',
+            (
+                f'{marker_prefix}_output_buffer_resolution='
+                f'owner:{type(scratch_owner).__name__ if scratch_owner is not None else "none"},'
+                f'target_shape:{tuple(int(v) for v in target_shape)},'
+                f'like_shape:{tuple(int(v) for v in like.shape)},reuse_mode:{owner_reason}'
+            ),
+        )
+        _ai3d_raw_marker_once(
+            f'{marker_prefix}_output_buffer_info',
+            (
+                f'{marker_prefix}_output_buffer='
+                f'module_cache,shape:{tuple(int(v) for v in owner_matched.shape)},axis:{int(write_axis)}'
+            ),
+        )
+        return owner_matched, 'owner_cache'
+
+    shared_candidate = None
+    if ai3d_use_5070ti_quality_path():
+        shared_candidate = _AI3D_ATTENTION_OUTPUT_BUFFERS.get(_attention_output_buffer_key(marker_prefix, like))
+    shared_matched, shared_reason = _matching_attention_output_buffer(
+        shared_candidate,
+        target_shape=target_shape,
+        like=like,
+    )
+    if shared_matched is not None:
+        _ai3d_raw_marker_once(
+            f'{marker_prefix}_output_buffer_resolution',
+            (
+                f'{marker_prefix}_output_buffer_resolution='
+                f'owner:shared_attention_cache,target_shape:{tuple(int(v) for v in target_shape)},'
+                f'like_shape:{tuple(int(v) for v in like.shape)},reuse_mode:{shared_reason}'
+            ),
+        )
+        _ai3d_raw_marker_once(
+            f'{marker_prefix}_output_buffer_info',
+            (
+                f'{marker_prefix}_output_buffer='
+                f'shared_cache,shape:{tuple(int(v) for v in shared_matched.shape)},axis:{int(write_axis)}'
+            ),
+        )
+        return shared_matched, 'shared_cache'
+
+    _ai3d_raw_marker_once(
+        f'{marker_prefix}_output_buffer_resolution_{id(scratch_owner) if scratch_owner is not None else "none"}',
+        (
+            f'{marker_prefix}_output_buffer_resolution='
+            f'owner:{type(scratch_owner).__name__ if scratch_owner is not None else "none"},'
+            f'target_shape:{tuple(int(v) for v in target_shape)},'
+            f'like_shape:{tuple(int(v) for v in like.shape)},'
+            f'output_buffer_present:{int(output_buffer is not None)},'
+            f'output_buffer_reason:{output_reason},'
+            f'cache_present:{int(owner_candidate is not None)},'
+            f'cache_reason:{owner_reason},'
+            f'shared_cache_present:{int(shared_candidate is not None)},'
+            f'shared_cache_reason:{shared_reason},'
+            f'fallback:new_empty'
+        ),
+    )
+    return like.new_empty(target_shape), 'fresh_alloc'
+
+
+def _remember_attention_output_buffer(
+    marker_prefix: str,
+    scratch_owner: Optional[object],
+    tensor: torch.Tensor,
+) -> None:
+    owner_cache = _get_attention_output_cache(scratch_owner)
+    if owner_cache is not None:
+        key = _attention_output_buffer_key(marker_prefix, tensor)
+        existing = owner_cache.get(key)
+        if existing is None or existing.numel() < tensor.numel():
+            owner_cache[key] = tensor
+    if ai3d_use_5070ti_quality_path():
+        key = _attention_output_buffer_key(marker_prefix, tensor)
+        existing = _AI3D_ATTENTION_OUTPUT_BUFFERS.get(key)
+        if existing is None or existing.numel() < tensor.numel():
+            _AI3D_ATTENTION_OUTPUT_BUFFERS[key] = tensor
+
+
+class _AttentionOutputWriter:
+    def __init__(
+        self,
+        out: torch.Tensor,
+        *,
+        marker_prefix: str,
+        extra_first_write_marker: Optional[str] = None,
+        extra_last_write_marker: Optional[str] = None,
+    ):
+        self.out = out
+        self.marker_prefix = marker_prefix
+        self.extra_first_write_marker = extra_first_write_marker
+        self.extra_last_write_marker = extra_last_write_marker
+        self._emitted_first_write = False
+        self._emitted_extra_first_write = False
+        self._emitted_any_write = False
+
+    def write(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        if not self._emitted_first_write:
+            _ai3d_raw_marker(f'{self.marker_prefix}_before_first_output_write')
+            self._emitted_first_write = True
+        if self.extra_first_write_marker is not None and not self._emitted_extra_first_write:
+            _ai3d_raw_marker(f'{self.marker_prefix}_{self.extra_first_write_marker}')
+            self._emitted_extra_first_write = True
+        dst.copy_(src)
+        self._emitted_any_write = True
+
+    def finalize(self) -> None:
+        if self._emitted_any_write:
+            _ai3d_raw_marker(f'{self.marker_prefix}_after_last_output_write')
+        if self.extra_last_write_marker is not None and self._emitted_extra_first_write:
+            _ai3d_raw_marker(f'{self.marker_prefix}_{self.extra_last_write_marker}')
 
 
 def _build_cu_seqlens(seqlen: Sequence[int], device: torch.device, marker_prefix: str) -> torch.Tensor:
@@ -101,14 +296,6 @@ def _use_diag_nonflash_self_attn_recombine_fix() -> bool:
     )
 
 
-def _use_diag_nonflash_self_attn_output_buffer_fix() -> bool:
-    return (
-        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
-        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
-        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
-    )
-
-
 def _diag_nonflash_q_chunk_size() -> int:
     raw = os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK', '').strip()
     if raw == '':
@@ -164,28 +351,31 @@ def _nonflash_math_sdp_context():
     return nullcontext()
 
 
-def _run_diag_nonflash_self_attn(qkv: torch.Tensor, q_seqlen: Sequence[int]) -> torch.Tensor:
-    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_entered')
-    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_alloc')
-    if _use_diag_nonflash_self_attn_output_buffer_fix():
-        out = qkv[:, 0]
-        _ai3d_raw_marker_once(
-            'pipeline_shape_slat_self_attn_nonflash_output_buffer_info',
-            (
-                'pipeline_shape_slat_self_attn_nonflash_output_buffer='
-                f'reused,shape:{tuple(int(v) for v in out.shape)},axis:0'
-            ),
-        )
-    else:
-        out = torch.empty_like(qkv[:, 0])
-    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_alloc')
-    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_kernel')
+def _run_diag_nonflash_self_attn(
+    qkv: torch.Tensor,
+    q_seqlen: Sequence[int],
+    *,
+    output_buffer: Optional[torch.Tensor] = None,
+    scratch_owner: Optional[object] = None,
+    marker_prefix: str = 'pipeline_shape_slat_self_attn_nonflash',
+) -> torch.Tensor:
+    _ai3d_raw_marker(f'{marker_prefix}_entered')
+    _ai3d_raw_marker(f'{marker_prefix}_before_output_alloc')
+    out, out_source = _acquire_attention_output_buffer(
+        qkv[:, 0],
+        marker_prefix=marker_prefix,
+        target_shape=tuple(int(v) for v in qkv[:, 0].shape),
+        output_buffer=output_buffer if ai3d_use_5070ti_quality_path() else None,
+        scratch_owner=scratch_owner,
+        write_axis=0,
+    )
+    _ai3d_raw_marker(f'{marker_prefix}_after_output_alloc')
+    writer = _AttentionOutputWriter(out, marker_prefix=marker_prefix)
+    _ai3d_raw_marker(f'{marker_prefix}_before_kernel')
     offset = 0
     chunk_size = _diag_nonflash_q_chunk_size()
     kv_chunk_size = _diag_nonflash_kv_chunk_size()
     use_recombine_fix = _use_diag_nonflash_self_attn_recombine_fix()
-    emitted_first_output_write = False
-    emitted_any_output_write = False
     with _nonflash_math_sdp_context():
         for length in q_seqlen:
             next_offset = offset + length
@@ -235,36 +425,28 @@ def _run_diag_nonflash_self_attn(qkv: torch.Tensor, q_seqlen: Sequence[int]) -> 
                             dropout_p=0.0,
                             is_causal=False,
                         )
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_kernel_return')
+                    _ai3d_raw_marker(f'{marker_prefix}_after_kernel_return')
                     if use_recombine_fix:
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_target_permute')
+                        _ai3d_raw_marker(f'{marker_prefix}_before_output_target_permute')
                         out_target = out[offset + q_start:offset + q_end].permute(1, 0, 2)
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_target_permute')
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_recombine')
-                        if not emitted_first_output_write:
-                            _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_first_output_write')
-                            emitted_first_output_write = True
-                        out_target.copy_(out_chunk[0])
-                        emitted_any_output_write = True
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_recombine')
+                        _ai3d_raw_marker(f'{marker_prefix}_after_output_target_permute')
+                        _ai3d_raw_marker(f'{marker_prefix}_before_output_recombine')
+                        writer.write(out_target, out_chunk[0])
+                        _ai3d_raw_marker(f'{marker_prefix}_after_output_recombine')
                         del out_target
                     else:
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_squeeze')
+                        _ai3d_raw_marker(f'{marker_prefix}_before_output_squeeze')
                         out_chunk = out_chunk.squeeze(0)
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_squeeze')
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_permute')
+                        _ai3d_raw_marker(f'{marker_prefix}_after_output_squeeze')
+                        _ai3d_raw_marker(f'{marker_prefix}_before_output_permute')
                         out_chunk = out_chunk.permute(1, 0, 2)
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_permute')
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_contiguous')
+                        _ai3d_raw_marker(f'{marker_prefix}_after_output_permute')
+                        _ai3d_raw_marker(f'{marker_prefix}_before_output_contiguous')
                         out_chunk = out_chunk.contiguous()
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_contiguous')
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_recombine')
-                        if not emitted_first_output_write:
-                            _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_first_output_write')
-                            emitted_first_output_write = True
-                        out[offset + q_start:offset + q_end].copy_(out_chunk)
-                        emitted_any_output_write = True
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_recombine')
+                        _ai3d_raw_marker(f'{marker_prefix}_after_output_contiguous')
+                        _ai3d_raw_marker(f'{marker_prefix}_before_output_recombine')
+                        writer.write(out[offset + q_start:offset + q_end], out_chunk)
+                        _ai3d_raw_marker(f'{marker_prefix}_after_output_recombine')
                     del out_chunk
             else:
                 out_chunk = torch.nn.functional.scaled_dot_product_attention(
@@ -274,44 +456,37 @@ def _run_diag_nonflash_self_attn(qkv: torch.Tensor, q_seqlen: Sequence[int]) -> 
                     dropout_p=0.0,
                     is_causal=False,
                 )
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_kernel_return')
+                _ai3d_raw_marker(f'{marker_prefix}_after_kernel_return')
                 if use_recombine_fix:
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_target_permute')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_output_target_permute')
                     out_target = out[offset:next_offset].permute(1, 0, 2)
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_target_permute')
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_recombine')
-                    if not emitted_first_output_write:
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_first_output_write')
-                        emitted_first_output_write = True
-                    out_target.copy_(out_chunk[0])
-                    emitted_any_output_write = True
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_recombine')
+                    _ai3d_raw_marker(f'{marker_prefix}_after_output_target_permute')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_output_recombine')
+                    writer.write(out_target, out_chunk[0])
+                    _ai3d_raw_marker(f'{marker_prefix}_after_output_recombine')
                     del out_target
                 else:
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_squeeze')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_output_squeeze')
                     out_chunk = out_chunk.squeeze(0)
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_squeeze')
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_permute')
+                    _ai3d_raw_marker(f'{marker_prefix}_after_output_squeeze')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_output_permute')
                     out_chunk = out_chunk.permute(1, 0, 2)
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_permute')
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_contiguous')
+                    _ai3d_raw_marker(f'{marker_prefix}_after_output_permute')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_output_contiguous')
                     out_chunk = out_chunk.contiguous()
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_contiguous')
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_output_recombine')
-                    if not emitted_first_output_write:
-                        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_first_output_write')
-                        emitted_first_output_write = True
-                    out[offset:next_offset].copy_(out_chunk)
-                    emitted_any_output_write = True
-                    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_output_recombine')
+                    _ai3d_raw_marker(f'{marker_prefix}_after_output_contiguous')
+                    _ai3d_raw_marker(f'{marker_prefix}_before_output_recombine')
+                    writer.write(out[offset:next_offset], out_chunk)
+                    _ai3d_raw_marker(f'{marker_prefix}_after_output_recombine')
                 del out_chunk
             offset = next_offset
-    if emitted_any_output_write:
-        _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_last_output_write')
-    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_kernel')
-    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_before_result_access')
+    writer.finalize()
+    if out_source != 'direct_output_buffer':
+        _remember_attention_output_buffer(marker_prefix, scratch_owner, out)
+    _ai3d_raw_marker(f'{marker_prefix}_after_kernel')
+    _ai3d_raw_marker(f'{marker_prefix}_before_result_access')
     _ = out.shape
-    _ai3d_raw_marker('pipeline_shape_slat_self_attn_nonflash_after_result_access')
+    _ai3d_raw_marker(f'{marker_prefix}_after_result_access')
     return out
 
 
@@ -322,10 +497,13 @@ def _run_diag_cross_attn_flash_q_chunk(
     q_seqlen: Sequence[int],
     kv_seqlen: Sequence[int],
     device: torch.device,
+    *,
+    output_buffer: Optional[torch.Tensor] = None,
+    scratch_owner: Optional[object] = None,
+    marker_prefix: str = 'pipeline_shape_slat_cross_attn_flash_attn',
 ) -> torch.Tensor:
     import flash_attn
 
-    marker_prefix = 'pipeline_shape_slat_cross_attn_flash_attn'
     q_chunk_size = _diag_cross_attn_flash_q_chunk_size()
     assert q_chunk_size > 0, 'diagnostic cross-attn flash q chunk size must be positive'
     max_q_seqlen = max(q_seqlen)
@@ -351,17 +529,25 @@ def _run_diag_cross_attn_flash_q_chunk(
         )
 
     _ai3d_raw_marker(f'{marker_prefix}_before_output_alloc')
-    # q is consumed chunk-by-chunk and not read again after each completed chunk,
-    # so its storage can safely become the destination buffer for the attention output.
-    out = q
+    out, out_source = _acquire_attention_output_buffer(
+        q,
+        marker_prefix=marker_prefix,
+        target_shape=tuple(int(v) for v in q.shape),
+        output_buffer=output_buffer,
+        scratch_owner=scratch_owner,
+        write_axis=0,
+    )
     _ai3d_raw_marker(f'{marker_prefix}_after_output_alloc')
+    writer = _AttentionOutputWriter(
+        out,
+        marker_prefix=marker_prefix,
+        extra_first_write_marker='before_first_q_chunk_write',
+        extra_last_write_marker='after_last_q_chunk_write',
+    )
     q_offsets = [0, *accumulate(q_seqlen)]
     kv_offsets = [0, *accumulate(kv_seqlen)]
     cu_cache: Dict[int, torch.Tensor] = {}
     emitted_first_q_chunk = False
-    emitted_first_output_write = False
-    emitted_first_q_chunk_write = False
-    emitted_any_write = False
 
     def _get_pair_cu(length: int) -> torch.Tensor:
         cached = cu_cache.get(length)
@@ -400,14 +586,7 @@ def _run_diag_cross_attn_flash_q_chunk(
                     kv_len,
                 )
                 _ai3d_raw_marker(f'{marker_prefix}_after_kernel')
-                if not emitted_first_output_write:
-                    _ai3d_raw_marker(f'{marker_prefix}_before_first_output_write')
-                    emitted_first_output_write = True
-                if not emitted_first_q_chunk_write:
-                    _ai3d_raw_marker(f'{marker_prefix}_before_first_q_chunk_write')
-                    emitted_first_q_chunk_write = True
-                out[q_start + local_q_start:q_start + local_q_end].copy_(out_chunk)
-                emitted_any_write = True
+                writer.write(out[q_start + local_q_start:q_start + local_q_end], out_chunk)
                 del q_chunk, out_chunk
         else:
             cu_q_seq = _get_pair_cu(q_len)
@@ -423,21 +602,14 @@ def _run_diag_cross_attn_flash_q_chunk(
                 kv_len,
             )
             _ai3d_raw_marker(f'{marker_prefix}_after_kernel')
-            if not emitted_first_output_write:
-                _ai3d_raw_marker(f'{marker_prefix}_before_first_output_write')
-                emitted_first_output_write = True
-            if not emitted_first_q_chunk_write:
-                _ai3d_raw_marker(f'{marker_prefix}_before_first_q_chunk_write')
-                emitted_first_q_chunk_write = True
-            out[q_start:q_end].copy_(out_chunk)
-            emitted_any_write = True
+            writer.write(out[q_start:q_end], out_chunk)
             del out_chunk
 
     if emitted_first_q_chunk:
         _ai3d_raw_marker(f'{marker_prefix}_after_last_q_chunk')
-    if emitted_any_write:
-        _ai3d_raw_marker(f'{marker_prefix}_after_last_output_write')
-        _ai3d_raw_marker(f'{marker_prefix}_after_last_q_chunk_write')
+    writer.finalize()
+    if out_source != 'direct_output_buffer':
+        _remember_attention_output_buffer(marker_prefix, scratch_owner, out)
     return out
 
 
@@ -513,6 +685,9 @@ def sparse_scaled_dot_product_attention(q: torch.Tensor, k: VarLenTensor, v: Var
     ...
 
 def sparse_scaled_dot_product_attention(*args, **kwargs):
+    output_buffer = kwargs.pop('output_buffer', None)
+    scratch_owner = kwargs.pop('scratch_owner', None)
+    marker_prefix = kwargs.pop('marker_prefix', None)
     arg_names_dict = {
         1: ['qkv'],
         2: ['q', 'kv'],
@@ -627,7 +802,13 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         if 'flash_attn' not in globals():
             import flash_attn
         if num_all_args == 1 and _use_diag_nonflash_self_attn():
-            out = _run_diag_nonflash_self_attn(qkv, q_seqlen)
+            out = _run_diag_nonflash_self_attn(
+                qkv,
+                q_seqlen,
+                output_buffer=output_buffer,
+                scratch_owner=scratch_owner,
+                marker_prefix=marker_prefix or 'pipeline_shape_slat_self_attn_nonflash',
+            )
             return s.replace(out) if s is not None else out
         cu_seqlens_q = _get_cached_cu_seqlens(
             q_cache_owner,
@@ -667,7 +848,17 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
         elif num_all_args == 3:
             if _use_diag_cross_attn_flash_q_chunk():
-                out = _run_diag_cross_attn_flash_q_chunk(q, k, v, q_seqlen, kv_seqlen, device)
+                out = _run_diag_cross_attn_flash_q_chunk(
+                    q,
+                    k,
+                    v,
+                    q_seqlen,
+                    kv_seqlen,
+                    device,
+                    output_buffer=output_buffer,
+                    scratch_owner=scratch_owner,
+                    marker_prefix=marker_prefix or 'pipeline_shape_slat_cross_attn_flash_attn',
+                )
             else:
                 _ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_before_kernel')
                 out = flash_attn.flash_attn_varlen_func(

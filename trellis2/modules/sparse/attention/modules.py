@@ -129,6 +129,26 @@ class SparseMultiHeadAttention(nn.Module):
             x_feats = x
         x_feats = x_feats.reshape(*x_feats.shape[:2], num_fused, self.num_heads, -1)
         return x.replace(x_feats.squeeze(0)) if isinstance(x, VarLenTensor) else x_feats
+
+    def _attention_output_plan_kwargs(
+        self,
+        buffer_source: Union[VarLenTensor, torch.Tensor],
+        *,
+        marker_prefix: str,
+        fused_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if not ai3d_use_5070ti_quality_path():
+            return {}
+        if isinstance(buffer_source, VarLenTensor):
+            feats = buffer_source.feats
+        else:
+            feats = buffer_source
+        output_buffer = feats[:, fused_index] if fused_index is not None else feats
+        return {
+            'output_buffer': output_buffer,
+            'scratch_owner': self,
+            'marker_prefix': marker_prefix,
+        }
     
     def forward(self, x: SparseTensor, context: Optional[Union[VarLenTensor, torch.Tensor]] = None) -> SparseTensor:
         if self._type == "self":
@@ -176,7 +196,14 @@ class SparseMultiHeadAttention(nn.Module):
                 qkv = qkv.replace(qkv_feats)
                 ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_replace')
             if self.attn_mode == "full":
-                h = sparse_scaled_dot_product_attention(qkv)
+                h = sparse_scaled_dot_product_attention(
+                    qkv,
+                    **self._attention_output_plan_kwargs(
+                        qkv,
+                        marker_prefix='pipeline_shape_slat_self_attn_nonflash',
+                        fused_index=0,
+                    ),
+                )
             elif self.attn_mode == "windowed":
                 h = sparse_windowed_scaled_dot_product_self_attention(
                     qkv, self.window_size, shift_window=self.shift_window
@@ -234,11 +261,26 @@ class SparseMultiHeadAttention(nn.Module):
                 )
                 if ai3d_use_5070ti_quality_path():
                     ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_before_sparse_call')
-                h = sparse_scaled_dot_product_attention(q, k, v)
+                h = sparse_scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    **self._attention_output_plan_kwargs(
+                        q,
+                        marker_prefix='pipeline_shape_slat_cross_attn_flash_attn',
+                    ),
+                )
                 if ai3d_use_5070ti_quality_path():
                     ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_before_result_access')
             else:
-                h = sparse_scaled_dot_product_attention(q, kv)
+                h = sparse_scaled_dot_product_attention(
+                    q,
+                    kv,
+                    **self._attention_output_plan_kwargs(
+                        q,
+                        marker_prefix='pipeline_shape_slat_cross_attn_flash_attn',
+                    ),
+                )
         h = self._reshape_chs(h, (-1,))
         if self._type == "cross" and ai3d_use_5070ti_quality_path():
             ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_after_result_access')
