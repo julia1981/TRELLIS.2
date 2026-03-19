@@ -96,6 +96,14 @@ def _ai3d_use_diag_texture_self_attn_k_rms_norm_fix() -> bool:
     )
 
 
+def _ai3d_use_diag_texture_self_attn_to_out_fix() -> bool:
+    return (
+        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
+    )
+
+
 def _ai3d_use_diag_cross_attn_to_q_fix() -> bool:
     return (
         os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
@@ -359,17 +367,32 @@ class SparseMultiHeadAttention(nn.Module):
                     output_buffer is not None
                     and output_buffer.shape == target_shape
                     and output_buffer.device == feats.device
+                    and output_buffer.dtype == feats.dtype
                 ):
                     out_feats = output_buffer
+                    if marker_prefix is not None:
+                        _ai3d_raw_marker_once(
+                            f'{marker_prefix}_output_buffer_info',
+                            (
+                                f'{marker_prefix}_output_buffer='
+                                f'reused,shape:{tuple(int(v) for v in out_feats.shape)},axis:0'
+                            ),
+                        )
                 else:
                     out_feats = feats.new_empty(target_shape)
                 if marker_prefix is not None:
                     _ai3d_raw_marker(f'{marker_prefix}_after_output_alloc')
+                wrote_any_chunk = False
                 for start in range(0, feats.shape[0], row_chunk):
                     end = min(start + row_chunk, feats.shape[0])
+                    if marker_prefix is not None and not wrote_any_chunk:
+                        _ai3d_raw_marker(f'{marker_prefix}_before_first_chunk_write')
                     chunk_out = F.linear(feats[start:end], module.weight, module.bias)
                     out_feats[start:end].copy_(chunk_out)
                     del chunk_out
+                    wrote_any_chunk = True
+                if marker_prefix is not None and wrote_any_chunk:
+                    _ai3d_raw_marker(f'{marker_prefix}_after_last_chunk_write')
             else:
                 out_feats = module(feats)
             if marker_prefix is not None:
@@ -584,7 +607,15 @@ class SparseMultiHeadAttention(nn.Module):
         h = self._reshape_chs(h, (-1,))
         if self._type == "cross" and _ai3d_use_diag_cross_attn_flash_q_chunk_fix():
             _ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_after_result_access')
-        if self._type == "cross" and _ai3d_use_diag_cross_attn_to_out_fix():
+        if self._type == "self" and _ai3d_use_diag_texture_self_attn_to_out_fix():
+            h = self._linear(
+                self.to_out,
+                h,
+                marker_prefix='pipeline_tex_slat_self_attn_to_out',
+                row_chunk=_ai3d_linear_row_chunk(),
+                output_buffer=h.feats,
+            )
+        elif self._type == "cross" and _ai3d_use_diag_cross_attn_to_out_fix():
             output_buffer = x.feats if _ai3d_use_diag_cross_attn_to_out_buffer_reuse_fix() else None
             h = self._linear(
                 self.to_out,
