@@ -157,24 +157,24 @@ class SparseMultiHeadAttention(nn.Module):
                     )
                 if self.use_rope:
                     q, k = self.rope(q, k)
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_q_feats')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_q_feats')
                 q_feats = q.feats
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_q_feats')
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_k_feats')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_q_feats')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_k_feats')
                 k_feats = k.feats
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_k_feats')
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_v_feats')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_k_feats')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_v_feats')
                 v_feats = v.feats
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_v_feats')
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_stack')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_v_feats')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_stack')
                 qkv_feats = qkv.feats
                 qkv_feats[:, 0].copy_(q_feats)
                 qkv_feats[:, 1].copy_(k_feats)
                 qkv_feats[:, 2].copy_(v_feats)
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_stack')
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_replace')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_stack')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_before_replace')
                 qkv = qkv.replace(qkv_feats)
-                _ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_replace')
+                ai3d_raw_marker('pipeline_shape_slat_self_attn_qkv_stack_after_replace')
             if self.attn_mode == "full":
                 h = sparse_scaled_dot_product_attention(qkv)
             elif self.attn_mode == "windowed":
@@ -223,25 +223,25 @@ class SparseMultiHeadAttention(nn.Module):
                     row_chunk=ai3d_linear_row_chunk() if ai3d_use_5070ti_quality_path() else 0,
                 )
                 if ai3d_use_5070ti_quality_path():
-                    _ai3d_raw_marker('pipeline_shape_slat_cross_attn_to_kv_before_split')
+                    ai3d_raw_marker('pipeline_shape_slat_cross_attn_to_kv_before_split')
                 k, v = kv.unbind(dim=-3)
                 if ai3d_use_5070ti_quality_path():
-                    _ai3d_raw_marker('pipeline_shape_slat_cross_attn_to_kv_after_split')
+                    ai3d_raw_marker('pipeline_shape_slat_cross_attn_to_kv_after_split')
                 k = self.k_rms_norm(
                     k,
                     marker_prefix='pipeline_shape_slat_cross_attn_k_rms_norm',
                     row_chunk=ai3d_linear_row_chunk() if ai3d_use_5070ti_quality_path() else 0,
                 )
                 if ai3d_use_5070ti_quality_path():
-                    _ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_before_sparse_call')
+                    ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_before_sparse_call')
                 h = sparse_scaled_dot_product_attention(q, k, v)
                 if ai3d_use_5070ti_quality_path():
-                    _ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_before_result_access')
+                    ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_before_result_access')
             else:
                 h = sparse_scaled_dot_product_attention(q, kv)
         h = self._reshape_chs(h, (-1,))
         if self._type == "cross" and ai3d_use_5070ti_quality_path():
-            _ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_after_result_access')
+            ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_after_result_access')
         if self._type == "self" and ai3d_use_5070ti_quality_path():
             h = self._linear(
                 self.to_out,
