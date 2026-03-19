@@ -265,6 +265,7 @@ class SparseMultiHeadAttention(nn.Module):
             self.k_rms_norm = SparseMultiHeadRMSNorm(self.head_dim, num_heads)
             
         self.to_out = nn.Linear(channels, channels)
+        self._ai3d_diag_cross_attn_to_kv_output_buffer: Optional[torch.Tensor] = None
 
         if use_rope:
             self.rope = SparseRotaryPositionEmbedder(self.head_dim, rope_freq=rope_freq)
@@ -448,26 +449,35 @@ class SparseMultiHeadAttention(nn.Module):
                 and isinstance(context, torch.Tensor)
             ):
                 kv_target_shape = (*context.shape[:-1], self.to_kv.out_features)
-                _ai3d_raw_marker('pipeline_shape_slat_cross_attn_to_kv_before_target_buffer_prepare')
-                kv_output_buffer = context.new_empty(kv_target_shape)
-                _ai3d_raw_marker('pipeline_shape_slat_cross_attn_to_kv_after_target_buffer_prepare')
-                _ai3d_raw_marker_once(
-                    'pipeline_shape_slat_cross_attn_to_kv_target_buffer_info',
-                    (
-                        'pipeline_shape_slat_cross_attn_to_kv_target_buffer='
-                        f'dedicated_prealloc,shape:{tuple(int(v) for v in kv_target_shape)},axis:1'
-                    ),
-                )
+                _ai3d_raw_marker('pipeline_shape_slat_cross_attn_to_kv_before_buffer_select')
+                candidate = self._ai3d_diag_cross_attn_to_kv_output_buffer
+                if (
+                    candidate is not None
+                    and candidate.shape == kv_target_shape
+                    and candidate.device == context.device
+                    and candidate.dtype == context.dtype
+                ):
+                    kv_output_buffer = candidate
+                    _ai3d_raw_marker_once(
+                        'pipeline_shape_slat_cross_attn_to_kv_output_buffer_info',
+                        (
+                            'pipeline_shape_slat_cross_attn_to_kv_output_buffer='
+                            f'module_cache,shape:{tuple(int(v) for v in candidate.shape)},axis:1'
+                        ),
+                    )
+                _ai3d_raw_marker('pipeline_shape_slat_cross_attn_to_kv_after_buffer_select')
             if _ai3d_use_diag_cross_attn_to_kv_fix():
-                kv = self._linear(
+                kv_dense = self._linear(
                     self.to_kv,
                     context,
                     marker_prefix='pipeline_shape_slat_cross_attn_to_kv',
                     row_chunk=_ai3d_linear_row_chunk(),
                     output_buffer=kv_output_buffer,
                 )
+                kv = kv_dense
             else:
                 kv = self._linear(self.to_kv, context)
+                kv_dense = None
             kv = self._fused_pre(kv, num_fused=2)
             if self.qk_rms_norm:
                 q = self.q_rms_norm(
@@ -493,6 +503,8 @@ class SparseMultiHeadAttention(nn.Module):
                     _ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_before_result_access')
             else:
                 h = sparse_scaled_dot_product_attention(q, kv)
+            if _ai3d_use_diag_cross_attn_to_kv_output_buffer_fix() and kv_dense is not None:
+                self._ai3d_diag_cross_attn_to_kv_output_buffer = kv_dense
         h = self._reshape_chs(h, (-1,))
         if self._type == "cross" and _ai3d_use_diag_cross_attn_flash_q_chunk_fix():
             _ai3d_raw_marker('pipeline_shape_slat_cross_attn_flash_attn_after_result_access')
