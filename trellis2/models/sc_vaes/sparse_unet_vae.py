@@ -33,6 +33,12 @@ def _ai3d_decode_boundary_log_once(key: str, message: str) -> None:
         pass
 
 
+def _ai3d_stable_sparse_snapshot(x: sp.SparseTensor) -> sp.SparseTensor:
+    stable = x.replace(x.feats.detach().clone(), x.coords.detach().clone())
+    stable.clear_spatial_cache()
+    return stable
+
+
 class SparseResBlock3d(nn.Module):
     def __init__(
         self,
@@ -585,7 +591,20 @@ class SparseUnetVaeDecoder(nn.Module):
                             h, sub = self._run_block_low_vram(block, h)
                         else:
                             h, sub = block(h)
-                        subs.append(sub)
+                        if return_subs and _ai3d_use_5070ti_quality_path():
+                            stable_sub = _ai3d_stable_sparse_snapshot(sub)
+                            _ai3d_decode_boundary_log_once(
+                                f'pipeline_decode_shape_sub_snapshot_stage_{i}',
+                                (
+                                    f'pipeline_decode_shape_sub_snapshot_stage_{i}='
+                                    f'rows:{int(stable_sub.feats.shape[0])},'
+                                    f'positive_rows:{int((stable_sub.feats > 0).sum().item())},'
+                                    f'dtype:{str(stable_sub.feats.dtype)}'
+                                ),
+                            )
+                            subs.append(stable_sub)
+                        else:
+                            subs.append(sub)
                     else:
                         subdiv = guide_subs[i] if guide_subs is not None else None
                         if subdiv is not None:
