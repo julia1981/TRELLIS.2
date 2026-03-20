@@ -1,5 +1,6 @@
 from typing import *
 import gc
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +8,29 @@ import torch.utils.checkpoint
 from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
+
+
+_AI3D_DECODE_BOUNDARY_ONCE = set()
+
+
+def _ai3d_use_5070ti_quality_path() -> bool:
+    return (
+        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
+        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
+    )
+
+
+def _ai3d_decode_boundary_log_once(key: str, message: str) -> None:
+    if not _ai3d_use_5070ti_quality_path():
+        return
+    if key in _AI3D_DECODE_BOUNDARY_ONCE:
+        return
+    _AI3D_DECODE_BOUNDARY_ONCE.add(key)
+    try:
+        os.write(2, f"[ai3d-decode] {message}\n".encode("utf-8", errors="replace"))
+    except Exception:
+        pass
 
 
 class SparseResBlock3d(nn.Module):
@@ -522,6 +546,30 @@ class SparseUnetVaeDecoder(nn.Module):
         
         h = self.from_latent(x)
         h = h.type(self.dtype)
+        if _ai3d_use_5070ti_quality_path() and (guide_subs is not None or return_subs):
+            h.clear_spatial_cache()
+        if guide_subs is not None:
+            _ai3d_decode_boundary_log_once(
+                'pipeline_decode_tex_decoder_entry',
+                (
+                    'pipeline_decode_tex_decoder_entry='
+                    f'x_dtype:{str(x.feats.dtype)},x_shape:{tuple(int(v) for v in x.feats.shape)},'
+                    f'x_coords:{int(x.coords.shape[0])},decoder_dtype:{str(self.dtype)},'
+                    f'guide_sub_count:{len(guide_subs)},guide_sub_rows:{[int(sub.feats.shape[0]) for sub in guide_subs]},'
+                    f'guide_sub_dtypes:{[str(sub.feats.dtype) for sub in guide_subs]},'
+                    f'had_channel2spatial_cache:{int(x.get_spatial_cache("channel2spatial_2") is not None)}'
+                ),
+            )
+        elif return_subs:
+            _ai3d_decode_boundary_log_once(
+                'pipeline_decode_shape_decoder_entry',
+                (
+                    'pipeline_decode_shape_decoder_entry='
+                    f'x_dtype:{str(x.feats.dtype)},x_shape:{tuple(int(v) for v in x.feats.shape)},'
+                    f'x_coords:{int(x.coords.shape[0])},decoder_dtype:{str(self.dtype)},'
+                    f'had_channel2spatial_cache:{int(x.get_spatial_cache("channel2spatial_2") is not None)}'
+                ),
+            )
         subs_gt = []
         subs = []
         low_vram_blocks = bool(self.low_vram and not self.training)
@@ -540,6 +588,36 @@ class SparseUnetVaeDecoder(nn.Module):
                         subs.append(sub)
                     else:
                         subdiv = guide_subs[i] if guide_subs is not None else None
+                        if subdiv is not None:
+                            current_rows = int(h.coords.shape[0])
+                            subdiv_rows = int(subdiv.feats.shape[0])
+                            if subdiv_rows != current_rows:
+                                matched_index = -1
+                                matched_subdiv = None
+                                for alt_index, alt_subdiv in enumerate(guide_subs):
+                                    if int(alt_subdiv.feats.shape[0]) == current_rows:
+                                        matched_index = alt_index
+                                        matched_subdiv = alt_subdiv
+                                        break
+                                _ai3d_decode_boundary_log_once(
+                                    f'pipeline_decode_tex_guide_sub_mismatch_stage_{i}',
+                                    (
+                                        f'pipeline_decode_tex_guide_sub_mismatch_stage_{i}='
+                                        f'h_rows:{current_rows},guide_rows:{subdiv_rows},'
+                                        f'h_dtype:{str(h.feats.dtype)},guide_dtype:{str(subdiv.feats.dtype)},'
+                                        f'guide_rows_all:{[int(sub.feats.shape[0]) for sub in guide_subs]},'
+                                        f'matched_index:{matched_index}'
+                                    ),
+                                )
+                                if matched_subdiv is not None:
+                                    subdiv = matched_subdiv
+                                    _ai3d_decode_boundary_log_once(
+                                        f'pipeline_decode_tex_guide_sub_resolved_stage_{i}',
+                                        (
+                                            f'pipeline_decode_tex_guide_sub_resolved_stage_{i}='
+                                            f'using_index:{matched_index},rows:{current_rows},dtype:{str(subdiv.feats.dtype)}'
+                                        ),
+                                    )
                         if low_vram_blocks:
                             h = self._run_block_low_vram(block, h, subdiv=subdiv)
                         else:

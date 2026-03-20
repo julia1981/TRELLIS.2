@@ -1,7 +1,21 @@
 from typing import *
+import os
 import torch
 import torch.nn as nn
 from .. import SparseTensor
+
+
+_AI3D_SPATIAL_BOUNDARY_ONCE = set()
+
+
+def _ai3d_spatial_boundary_log_once(key: str, message: str) -> None:
+    if key in _AI3D_SPATIAL_BOUNDARY_ONCE:
+        return
+    _AI3D_SPATIAL_BOUNDARY_ONCE.add(key)
+    try:
+        os.write(2, f"[ai3d-decode] {message}\n".encode('utf-8', errors='replace'))
+    except Exception:
+        pass
 
 
 class SparseSpatial2Channel(nn.Module):
@@ -77,6 +91,18 @@ class SparseChannel2Spatial(nn.Module):
                 subidx = sub.nonzero()[:, -1]
                 new_coords = x.coords.clone().detach()
                 new_coords[:, 1:] *= self.factor
+                if N_leaf.shape[0] != new_coords.shape[0]:
+                    _ai3d_spatial_boundary_log_once(
+                        f'pipeline_decode_tex_spatial2channel_input_mismatch_factor_{self.factor}',
+                        (
+                            f'pipeline_decode_tex_spatial2channel_input_mismatch_factor_{self.factor}='
+                            f'input_rows:{int(new_coords.shape[0])},repeats_rows:{int(N_leaf.shape[0])},'
+                            f'subidx_rows:{int(subidx.shape[0])},input_dtype:{str(x.feats.dtype)},'
+                            f'subdivision_dtype:{str(subdivision.feats.dtype)},'
+                            f'input_shape:{tuple(int(v) for v in x.feats.shape)},'
+                            f'subdivision_shape:{tuple(int(v) for v in subdivision.feats.shape)}'
+                        ),
+                    )
                 new_coords = torch.repeat_interleave(new_coords, N_leaf, dim=0, output_size=subidx.shape[0])
                 for i in range(DIM):
                     new_coords[:, i+1] += subidx // self.factor ** i % self.factor
