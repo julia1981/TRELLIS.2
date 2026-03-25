@@ -46,6 +46,7 @@ def from_pretrained(path: str, **kwargs):
     """
     import os
     import json
+    import inspect
     from safetensors.torch import load_file
     is_local = os.path.exists(f"{path}.json") and os.path.exists(f"{path}.safetensors")
 
@@ -62,7 +63,11 @@ def from_pretrained(path: str, **kwargs):
 
     with open(config_file, 'r') as f:
         config = json.load(f)
-    model = __getattr__(config['name'])(**config['args'], **kwargs)
+    model_cls = __getattr__(config['name'])
+    model_kwargs = {**config['args'], **kwargs}
+    if 'skip_init' in inspect.signature(model_cls).parameters and 'skip_init' not in model_kwargs:
+        model_kwargs['skip_init'] = True
+    model = model_cls(**model_kwargs)
     model.load_state_dict(load_file(model_file), strict=False)
 
     return model
