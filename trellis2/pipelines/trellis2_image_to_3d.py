@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from .base import Pipeline
 from . import samplers, rembg
+from .. import models as trellis_models
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
@@ -33,10 +34,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         'sparse_structure_decoder',
         'shape_slat_flow_model_512',
         'shape_slat_flow_model_1024',
-        'shape_slat_decoder',
         'tex_slat_flow_model_512',
         'tex_slat_flow_model_1024',
-        'tex_slat_decoder',
     ]
 
     def __init__(
@@ -78,6 +77,29 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         }
         self._device = 'cpu'
 
+    def _ai3d_get_or_load_model(self, model_key: str) -> nn.Module:
+        model = self.models.get(model_key)
+        if model is not None:
+            return model
+
+        pretrained_args = getattr(self, '_pretrained_args', None)
+        models_config = pretrained_args.get('models', {}) if isinstance(pretrained_args, dict) else {}
+        model_ref = models_config.get(model_key)
+        if not isinstance(model_ref, str) or not model_ref:
+            raise KeyError(f"Missing pretrained model ref for {model_key}")
+
+        model_source = getattr(self, '_ai3d_model_source', None)
+        try:
+            if isinstance(model_source, str) and model_source:
+                model = trellis_models.from_pretrained(f"{model_source}/{model_ref}")
+            else:
+                model = trellis_models.from_pretrained(model_ref)
+        except Exception:
+            model = trellis_models.from_pretrained(model_ref)
+        model.eval()
+        self.models[model_key] = model
+        return model
+
     @classmethod
     def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Trellis2ImageTo3DPipeline":
         """
@@ -113,6 +135,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             'alpha': slice(5, 6),
         }
         pipeline._device = 'cpu'
+        pipeline._ai3d_model_source = path
 
         return pipeline
 
@@ -317,13 +340,14 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         slat = slat * std + mean
         
         # Upsample
+        shape_decoder = self._ai3d_get_or_load_model('shape_slat_decoder')
         if self.low_vram:
-            self.models['shape_slat_decoder'].to(self.device)
-            self.models['shape_slat_decoder'].low_vram = True
-        hr_coords = self.models['shape_slat_decoder'].upsample(slat, upsample_times=4)
+            shape_decoder.to(self.device)
+            shape_decoder.low_vram = True
+        hr_coords = shape_decoder.upsample(slat, upsample_times=4)
         if self.low_vram:
-            self.models['shape_slat_decoder'].cpu()
-            self.models['shape_slat_decoder'].low_vram = False
+            shape_decoder.cpu()
+            shape_decoder.low_vram = False
         hr_resolution = resolution
         while True:
             quant_coords = torch.cat([
@@ -378,14 +402,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             List[Mesh]: The decoded meshes.
             List[SparseTensor]: The decoded substructures.
         """
-        self.models['shape_slat_decoder'].set_resolution(resolution)
+        shape_decoder = self._ai3d_get_or_load_model('shape_slat_decoder')
+        shape_decoder.set_resolution(resolution)
         if self.low_vram:
-            self.models['shape_slat_decoder'].to(self.device)
-            self.models['shape_slat_decoder'].low_vram = True
-        ret = self.models['shape_slat_decoder'](slat, return_subs=True)
+            shape_decoder.to(self.device)
+            shape_decoder.low_vram = True
+        ret = shape_decoder(slat, return_subs=True)
         if self.low_vram:
-            self.models['shape_slat_decoder'].cpu()
-            self.models['shape_slat_decoder'].low_vram = False
+            shape_decoder.cpu()
+            shape_decoder.low_vram = False
         return ret
     
     def sample_tex_slat(
@@ -537,11 +562,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         Returns:
             SparseTensor: The decoded texture voxels
         """
+        tex_decoder = self._ai3d_get_or_load_model('tex_slat_decoder')
         if self.low_vram:
-            self.models['tex_slat_decoder'].to(self.device)
-        ret = self.models['tex_slat_decoder'](slat, guide_subs=subs) * 0.5 + 0.5
+            tex_decoder.to(self.device)
+        ret = tex_decoder(slat, guide_subs=subs) * 0.5 + 0.5
         if self.low_vram:
-            self.models['tex_slat_decoder'].cpu()
+            tex_decoder.cpu()
         return ret
     
     @torch.no_grad()
