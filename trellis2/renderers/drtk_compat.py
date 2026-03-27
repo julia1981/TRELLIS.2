@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable, Tuple
 
 import torch
+import torch.nn.functional as F
 
 try:
     import drtk  # type: ignore
@@ -14,6 +15,10 @@ except Exception as exc:  # pragma: no cover - runtime only
 @dataclass
 class RasterizeCudaContext:
     device: str | torch.device = "cuda"
+
+
+# utils3d.torch.rasterization resolves both symbols at import time.
+RasterizeGLContext = RasterizeCudaContext
 
 
 def _to_hw(resolution: Iterable[int]) -> Tuple[int, int]:
@@ -44,6 +49,8 @@ def rasterize(
     pos: torch.Tensor,
     tri: torch.Tensor,
     resolution: Iterable[int],
+    grad_db: bool = False,
+    **_kwargs,
 ):
     # nvdiffrast-compatible subset used by o_voxel.postprocess.
     # pos: [1, V, 4], tri: [F, 3]
@@ -80,13 +87,19 @@ def rasterize(
         index_img[0].to(torch.float32) + 1.0,
         torch.zeros_like(index_img[0], dtype=torch.float32),
     )
-    return rast, None
+    rast_db = None
+    if grad_db:
+        rast_db = torch.zeros_like(rast)
+    return rast, rast_db
 
 
 def interpolate(
     attr: torch.Tensor,
     rast: torch.Tensor,
     tri: torch.Tensor,
+    rast_db: torch.Tensor | None = None,
+    diff_attrs=None,
+    **_kwargs,
 ):
     # nvdiffrast-compatible subset used by o_voxel.postprocess.
     # attr: [1, V, C], rast: [1, H, W, 4], tri: [F, 3]
@@ -113,4 +126,53 @@ def interpolate(
         out_vals = (v0 * bary[:, 0:1]) + (v1 * bary[:, 1:2]) + (v2 * bary[:, 2:3])
         out[0, valid] = out_vals
 
-    return out, None
+    out_dr = None
+    if diff_attrs is not None or rast_db is not None:
+        out_dr = torch.zeros(
+            (out.shape[0], out.shape[1], out.shape[2], out.shape[3] * 2),
+            dtype=out.dtype,
+            device=out.device,
+        )
+    return out, out_dr
+
+
+def antialias(
+    image: torch.Tensor,
+    _rast: torch.Tensor,
+    _pos_clip: torch.Tensor,
+    _tri: torch.Tensor,
+    **_kwargs,
+) -> torch.Tensor:
+    return image
+
+
+def texture(
+    tex: torch.Tensor,
+    texc: torch.Tensor,
+    texd: torch.Tensor | None = None,
+    *,
+    filter_mode: str = "linear",
+    boundary_mode: str = "wrap",
+    **_kwargs,
+):
+    if tex.dim() != 4:
+        raise ValueError(f"texture must be [B, H, W, C], got {tuple(tex.shape)}")
+    if texc.dim() != 4 or texc.shape[-1] < 2:
+        raise ValueError(f"texc must be [B, H, W, 2], got {tuple(texc.shape)}")
+    tex_in = tex.permute(0, 3, 1, 2).contiguous()
+    coords = texc[..., :2]
+    if boundary_mode == "wrap":
+        coords = torch.remainder(coords, 1.0)
+    else:
+        coords = torch.clamp(coords, 0.0, 1.0)
+    grid = torch.empty_like(coords)
+    grid[..., 0] = coords[..., 0] * 2.0 - 1.0
+    grid[..., 1] = (1.0 - coords[..., 1]) * 2.0 - 1.0
+    sampled = F.grid_sample(
+        tex_in,
+        grid,
+        mode="nearest" if "nearest" in str(filter_mode).lower() else "bilinear",
+        padding_mode="border" if boundary_mode == "clamp" else "zeros",
+        align_corners=True,
+    )
+    return sampled.permute(0, 2, 3, 1).contiguous()
