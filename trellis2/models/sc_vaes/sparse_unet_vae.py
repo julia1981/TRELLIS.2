@@ -8,6 +8,7 @@ import torch.utils.checkpoint
 from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
+from ...modules.sparse.linear import chunked_elementwise, chunked_linear
 
 
 _AI3D_DECODE_BOUNDARY_ONCE = set()
@@ -312,10 +313,45 @@ class SparseConvNeXtBlock3d(nn.Module):
             zero_module(nn.Linear(int(channels * mlp_ratio), channels)),
         )
 
+    def _run_mlp(self, feats: torch.Tensor) -> torch.Tensor:
+        row_chunk = int(getattr(self, "_ai3d_mlp_row_chunk", 0) or 0)
+        if row_chunk <= 0 or feats.shape[0] <= row_chunk:
+            return self.mlp(feats)
+        hidden = chunked_linear(
+            self.mlp[0],
+            feats,
+            row_chunk=row_chunk,
+            marker_prefix="pipeline_decode_tex_convnext_mlp_fc1",
+            marker_style="sparse_linear",
+            token_axis=0,
+            buffer_owner=self,
+            cache_attr="_ai3d_mlp_fc1_output_buffer",
+        )
+        hidden = chunked_elementwise(
+            hidden,
+            op=F.silu,
+            row_chunk=row_chunk,
+            marker_prefix="pipeline_decode_tex_convnext_mlp_silu",
+            op_name="silu",
+            token_axis=0,
+            buffer_owner=self,
+            cache_attr="_ai3d_mlp_silu_output_buffer",
+        )
+        return chunked_linear(
+            self.mlp[2],
+            hidden,
+            row_chunk=row_chunk,
+            marker_prefix="pipeline_decode_tex_convnext_mlp_fc2",
+            marker_style="sparse_linear",
+            token_axis=0,
+            buffer_owner=self,
+            cache_attr="_ai3d_mlp_fc2_output_buffer",
+        )
+
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
         h = h.replace(self.norm(h.feats))
-        h = h.replace(self.mlp(h.feats))
+        h = h.replace(self._run_mlp(h.feats))
         return h + x
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
