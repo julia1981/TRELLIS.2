@@ -8,7 +8,13 @@ import torch.utils.checkpoint
 from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
-from ...modules.sparse.linear import chunked_elementwise, chunked_linear
+from ...modules.sparse.linear import (
+    _acquire_output_buffer,
+    _copy_along_axis,
+    _slice_along_axis,
+    chunked_elementwise,
+    chunked_linear,
+)
 
 
 _AI3D_DECODE_BOUNDARY_ONCE = set()
@@ -42,6 +48,10 @@ def _ai3d_runtime_log_once(key: str, message: str) -> None:
         os.write(2, f"[ai3d-runtime] {message}\n".encode("utf-8", errors="replace"))
     except Exception:
         pass
+
+
+def _ai3d_decode_tex_mlp_streaming_enabled() -> bool:
+    return os.environ.get("ML_TRELLIS2_DECODE_TEX_MLP_STREAM_OUTPUT", "0") == "1"
 
 
 def _ai3d_stable_sparse_snapshot(x: sp.SparseTensor) -> sp.SparseTensor:
@@ -328,16 +338,46 @@ class SparseConvNeXtBlock3d(nn.Module):
         rows = int(feats.shape[0]) if feats.ndim > 0 else 0
         channels = int(feats.shape[-1]) if feats.ndim > 0 else 0
         use_chunk = row_chunk > 0 and rows > row_chunk
+        use_streaming = use_chunk and _ai3d_decode_tex_mlp_streaming_enabled()
         _ai3d_runtime_log_once(
-            f"pipeline_decode_tex_convnext_mlp_plan_rows_{rows}_chunk_{row_chunk}_mode_{int(use_chunk)}",
+            f"pipeline_decode_tex_convnext_mlp_plan_rows_{rows}_chunk_{row_chunk}_mode_{int(use_chunk)}_stream_{int(use_streaming)}",
             (
                 "pipeline_decode_tex_convnext_mlp_plan="
-                f"rows:{rows},channels:{channels},dtype:{str(feats.dtype)},row_chunk:{row_chunk},chunked:{int(use_chunk)}"
+                f"rows:{rows},channels:{channels},dtype:{str(feats.dtype)},row_chunk:{row_chunk},"
+                f"chunked:{int(use_chunk)},streaming:{int(use_streaming)}"
             ),
         )
         try:
             if not use_chunk:
                 return self.mlp(feats)
+            if use_streaming:
+                _ai3d_runtime_log_once(
+                    f"pipeline_decode_tex_convnext_mlp_streaming_rows_{rows}_chunk_{row_chunk}",
+                    (
+                        "pipeline_decode_tex_convnext_mlp_streaming="
+                        f"rows:{rows},channels:{channels},dtype:{str(feats.dtype)},row_chunk:{row_chunk},"
+                        f"output_shape:{tuple(int(v) for v in feats.shape)},hidden_buffer_allocated:0"
+                    ),
+                )
+                out_feats, _ = _acquire_output_buffer(
+                    feats,
+                    target_shape=tuple(int(v) for v in feats.shape),
+                    output_buffer=None,
+                    buffer_owner=self,
+                    cache_attr="_ai3d_mlp_stream_output_buffer",
+                    marker_prefix="pipeline_decode_tex_convnext_mlp_stream_output",
+                )
+                for start in range(0, rows, row_chunk):
+                    end = min(start + row_chunk, rows)
+                    work_chunk = _slice_along_axis(feats, 0, start, end)
+                    work_chunk = F.linear(work_chunk, self.mlp[0].weight, self.mlp[0].bias)
+                    work_chunk = F.silu(work_chunk)
+                    work_chunk = F.linear(work_chunk, self.mlp[2].weight, self.mlp[2].bias)
+                    if work_chunk.dtype != out_feats.dtype:
+                        work_chunk = work_chunk.to(dtype=out_feats.dtype)
+                    _copy_along_axis(out_feats, work_chunk, 0, start, end)
+                    del work_chunk
+                return out_feats
             hidden = chunked_linear(
                 self.mlp[0],
                 feats,
