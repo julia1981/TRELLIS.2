@@ -34,6 +34,16 @@ def _ai3d_decode_boundary_log_once(key: str, message: str) -> None:
         pass
 
 
+def _ai3d_runtime_log_once(key: str, message: str) -> None:
+    if key in _AI3D_DECODE_BOUNDARY_ONCE:
+        return
+    _AI3D_DECODE_BOUNDARY_ONCE.add(key)
+    try:
+        os.write(2, f"[ai3d-runtime] {message}\n".encode("utf-8", errors="replace"))
+    except Exception:
+        pass
+
+
 def _ai3d_stable_sparse_snapshot(x: sp.SparseTensor) -> sp.SparseTensor:
     stable = x.replace(x.feats.detach().clone(), x.coords.detach().clone())
     stable.clear_spatial_cache()
@@ -315,38 +325,59 @@ class SparseConvNeXtBlock3d(nn.Module):
 
     def _run_mlp(self, feats: torch.Tensor) -> torch.Tensor:
         row_chunk = int(getattr(self, "_ai3d_mlp_row_chunk", 0) or 0)
-        if row_chunk <= 0 or feats.shape[0] <= row_chunk:
-            return self.mlp(feats)
-        hidden = chunked_linear(
-            self.mlp[0],
-            feats,
-            row_chunk=row_chunk,
-            marker_prefix="pipeline_decode_tex_convnext_mlp_fc1",
-            marker_style="sparse_linear",
-            token_axis=0,
-            buffer_owner=self,
-            cache_attr="_ai3d_mlp_fc1_output_buffer",
+        rows = int(feats.shape[0]) if feats.ndim > 0 else 0
+        channels = int(feats.shape[-1]) if feats.ndim > 0 else 0
+        use_chunk = row_chunk > 0 and rows > row_chunk
+        _ai3d_runtime_log_once(
+            f"pipeline_decode_tex_convnext_mlp_plan_rows_{rows}_chunk_{row_chunk}_mode_{int(use_chunk)}",
+            (
+                "pipeline_decode_tex_convnext_mlp_plan="
+                f"rows:{rows},channels:{channels},dtype:{str(feats.dtype)},row_chunk:{row_chunk},chunked:{int(use_chunk)}"
+            ),
         )
-        hidden = chunked_elementwise(
-            hidden,
-            op=F.silu,
-            row_chunk=row_chunk,
-            marker_prefix="pipeline_decode_tex_convnext_mlp_silu",
-            op_name="silu",
-            token_axis=0,
-            buffer_owner=self,
-            cache_attr="_ai3d_mlp_silu_output_buffer",
-        )
-        return chunked_linear(
-            self.mlp[2],
-            hidden,
-            row_chunk=row_chunk,
-            marker_prefix="pipeline_decode_tex_convnext_mlp_fc2",
-            marker_style="sparse_linear",
-            token_axis=0,
-            buffer_owner=self,
-            cache_attr="_ai3d_mlp_fc2_output_buffer",
-        )
+        try:
+            if not use_chunk:
+                return self.mlp(feats)
+            hidden = chunked_linear(
+                self.mlp[0],
+                feats,
+                row_chunk=row_chunk,
+                marker_prefix="pipeline_decode_tex_convnext_mlp_fc1",
+                marker_style="sparse_linear",
+                token_axis=0,
+                buffer_owner=self,
+                cache_attr="_ai3d_mlp_fc1_output_buffer",
+            )
+            hidden = chunked_elementwise(
+                hidden,
+                op=F.silu,
+                row_chunk=row_chunk,
+                marker_prefix="pipeline_decode_tex_convnext_mlp_silu",
+                op_name="silu",
+                token_axis=0,
+                buffer_owner=self,
+                cache_attr="_ai3d_mlp_silu_output_buffer",
+            )
+            return chunked_linear(
+                self.mlp[2],
+                hidden,
+                row_chunk=row_chunk,
+                marker_prefix="pipeline_decode_tex_convnext_mlp_fc2",
+                marker_style="sparse_linear",
+                token_axis=0,
+                buffer_owner=self,
+                cache_attr="_ai3d_mlp_fc2_output_buffer",
+            )
+        except Exception as exc:
+            _ai3d_runtime_log_once(
+                f"pipeline_decode_tex_convnext_mlp_failure_rows_{rows}_chunk_{row_chunk}_mode_{int(use_chunk)}",
+                (
+                    "pipeline_decode_tex_convnext_mlp_failure="
+                    f"rows:{rows},channels:{channels},dtype:{str(feats.dtype)},row_chunk:{row_chunk},"
+                    f"chunked:{int(use_chunk)},error:{str(exc)[:240]}"
+                ),
+            )
+            raise
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
