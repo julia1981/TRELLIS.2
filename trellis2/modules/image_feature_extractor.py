@@ -82,8 +82,13 @@ class DinoV3FeatureExtractor:
         image = image.to(self.model.embeddings.patch_embeddings.weight.dtype)
         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.model.rope_embeddings(image)
+        encoder_layers = getattr(self.model, "layer", None)
+        if encoder_layers is None and hasattr(self.model, "model"):
+            encoder_layers = getattr(self.model.model, "layer", None)
+        if encoder_layers is None:
+            raise AttributeError("DINOv3ViTModel encoder layers not found")
 
-        for i, layer_module in enumerate(self.model.layer):
+        for i, layer_module in enumerate(encoder_layers):
             hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,

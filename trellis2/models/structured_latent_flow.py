@@ -32,7 +32,6 @@ class SLatFlowModel(nn.Module):
         initialization: str = 'vanilla',
         qk_rms_norm: bool = False,
         qk_rms_norm_cross: bool = False,
-        skip_init: bool = False,
     ):
         super().__init__()
         self.resolution = resolution
@@ -82,8 +81,7 @@ class SLatFlowModel(nn.Module):
             
         self.out_layer = sp.SparseLinear(model_channels, out_channels)
 
-        if not skip_init:
-            self.initialize_weights()
+        self.initialize_weights()
         self.convert_to(self.dtype)
 
     @property

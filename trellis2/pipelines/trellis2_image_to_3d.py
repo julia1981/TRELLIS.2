@@ -34,8 +34,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         'sparse_structure_decoder',
         'shape_slat_flow_model_512',
         'shape_slat_flow_model_1024',
+        'shape_slat_decoder',
         'tex_slat_flow_model_512',
         'tex_slat_flow_model_1024',
+        'tex_slat_decoder',
     ]
 
     def __init__(

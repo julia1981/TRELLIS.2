@@ -1,6 +1,4 @@
 from typing import *
-import gc
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,56 +6,6 @@ import torch.utils.checkpoint
 from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
-from ...modules.sparse.linear import (
-    _acquire_output_buffer,
-    _copy_along_axis,
-    _slice_along_axis,
-    chunked_elementwise,
-    chunked_linear,
-)
-
-
-_AI3D_DECODE_BOUNDARY_ONCE = set()
-
-
-def _ai3d_use_5070ti_quality_path() -> bool:
-    return (
-        os.environ.get('AI3D_SELF_ATTN_NONFLASH_DIAG') == '1'
-        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_Q_CHUNK') == '64'
-        and os.environ.get('AI3D_SELF_ATTN_NONFLASH_KV_CHUNK') == '512'
-    )
-
-
-def _ai3d_decode_boundary_log_once(key: str, message: str) -> None:
-    if not _ai3d_use_5070ti_quality_path():
-        return
-    if key in _AI3D_DECODE_BOUNDARY_ONCE:
-        return
-    _AI3D_DECODE_BOUNDARY_ONCE.add(key)
-    try:
-        os.write(2, f"[ai3d-decode] {message}\n".encode("utf-8", errors="replace"))
-    except Exception:
-        pass
-
-
-def _ai3d_runtime_log_once(key: str, message: str) -> None:
-    if key in _AI3D_DECODE_BOUNDARY_ONCE:
-        return
-    _AI3D_DECODE_BOUNDARY_ONCE.add(key)
-    try:
-        os.write(2, f"[ai3d-runtime] {message}\n".encode("utf-8", errors="replace"))
-    except Exception:
-        pass
-
-
-def _ai3d_decode_tex_mlp_streaming_enabled() -> bool:
-    return os.environ.get("ML_TRELLIS2_DECODE_TEX_MLP_STREAM_OUTPUT", "0") == "1"
-
-
-def _ai3d_stable_sparse_snapshot(x: sp.SparseTensor) -> sp.SparseTensor:
-    stable = x.replace(x.feats.detach().clone(), x.coords.detach().clone())
-    stable.clear_spatial_cache()
-    return stable
 
 
 class SparseResBlock3d(nn.Module):
@@ -333,96 +281,10 @@ class SparseConvNeXtBlock3d(nn.Module):
             zero_module(nn.Linear(int(channels * mlp_ratio), channels)),
         )
 
-    def _run_mlp(self, feats: torch.Tensor) -> torch.Tensor:
-        row_chunk = int(getattr(self, "_ai3d_mlp_row_chunk", 0) or 0)
-        rows = int(feats.shape[0]) if feats.ndim > 0 else 0
-        channels = int(feats.shape[-1]) if feats.ndim > 0 else 0
-        use_chunk = row_chunk > 0 and rows > row_chunk
-        use_streaming = use_chunk and _ai3d_decode_tex_mlp_streaming_enabled()
-        _ai3d_runtime_log_once(
-            f"pipeline_decode_tex_convnext_mlp_plan_rows_{rows}_chunk_{row_chunk}_mode_{int(use_chunk)}_stream_{int(use_streaming)}",
-            (
-                "pipeline_decode_tex_convnext_mlp_plan="
-                f"rows:{rows},channels:{channels},dtype:{str(feats.dtype)},row_chunk:{row_chunk},"
-                f"chunked:{int(use_chunk)},streaming:{int(use_streaming)}"
-            ),
-        )
-        try:
-            if not use_chunk:
-                return self.mlp(feats)
-            if use_streaming:
-                _ai3d_runtime_log_once(
-                    f"pipeline_decode_tex_convnext_mlp_streaming_rows_{rows}_chunk_{row_chunk}",
-                    (
-                        "pipeline_decode_tex_convnext_mlp_streaming="
-                        f"rows:{rows},channels:{channels},dtype:{str(feats.dtype)},row_chunk:{row_chunk},"
-                        f"output_shape:{tuple(int(v) for v in feats.shape)},hidden_buffer_allocated:0"
-                    ),
-                )
-                out_feats, _ = _acquire_output_buffer(
-                    feats,
-                    target_shape=tuple(int(v) for v in feats.shape),
-                    output_buffer=None,
-                    buffer_owner=self,
-                    cache_attr="_ai3d_mlp_stream_output_buffer",
-                    marker_prefix="pipeline_decode_tex_convnext_mlp_stream_output",
-                )
-                for start in range(0, rows, row_chunk):
-                    end = min(start + row_chunk, rows)
-                    work_chunk = _slice_along_axis(feats, 0, start, end)
-                    work_chunk = F.linear(work_chunk, self.mlp[0].weight, self.mlp[0].bias)
-                    work_chunk = F.silu(work_chunk)
-                    work_chunk = F.linear(work_chunk, self.mlp[2].weight, self.mlp[2].bias)
-                    if work_chunk.dtype != out_feats.dtype:
-                        work_chunk = work_chunk.to(dtype=out_feats.dtype)
-                    _copy_along_axis(out_feats, work_chunk, 0, start, end)
-                    del work_chunk
-                return out_feats
-            hidden = chunked_linear(
-                self.mlp[0],
-                feats,
-                row_chunk=row_chunk,
-                marker_prefix="pipeline_decode_tex_convnext_mlp_fc1",
-                marker_style="sparse_linear",
-                token_axis=0,
-                buffer_owner=self,
-                cache_attr="_ai3d_mlp_fc1_output_buffer",
-            )
-            hidden = chunked_elementwise(
-                hidden,
-                op=F.silu,
-                row_chunk=row_chunk,
-                marker_prefix="pipeline_decode_tex_convnext_mlp_silu",
-                op_name="silu",
-                token_axis=0,
-                buffer_owner=self,
-                cache_attr="_ai3d_mlp_silu_output_buffer",
-            )
-            return chunked_linear(
-                self.mlp[2],
-                hidden,
-                row_chunk=row_chunk,
-                marker_prefix="pipeline_decode_tex_convnext_mlp_fc2",
-                marker_style="sparse_linear",
-                token_axis=0,
-                buffer_owner=self,
-                cache_attr="_ai3d_mlp_fc2_output_buffer",
-            )
-        except Exception as exc:
-            _ai3d_runtime_log_once(
-                f"pipeline_decode_tex_convnext_mlp_failure_rows_{rows}_chunk_{row_chunk}_mode_{int(use_chunk)}",
-                (
-                    "pipeline_decode_tex_convnext_mlp_failure="
-                    f"rows:{rows},channels:{channels},dtype:{str(feats.dtype)},row_chunk:{row_chunk},"
-                    f"chunked:{int(use_chunk)},error:{str(exc)[:240]}"
-                ),
-            )
-            raise
-
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
         h = h.replace(self.norm(h.feats))
-        h = h.replace(self._run_mlp(h.feats))
+        h = h.replace(self.mlp(h.feats))
         return h + x
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
@@ -613,146 +475,26 @@ class SparseUnetVaeDecoder(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-    def _low_vram_cleanup(self) -> None:
-        if not torch.cuda.is_available():
-            return
-        gc.collect()
-        try:
-            torch.cuda.synchronize()
-        except Exception:
-            pass
-        torch.cuda.empty_cache()
-        try:
-            torch.cuda.ipc_collect()
-        except Exception:
-            pass
-
-    def _prepare_blocks_for_low_vram(self) -> None:
-        for res in self.blocks:
-            res.cpu()
-        self._low_vram_cleanup()
-
-    def _run_block_low_vram(
-        self,
-        block: nn.Module,
-        h: sp.SparseTensor,
-        subdiv: Optional[sp.SparseTensor] = None,
-    ):
-        block.to(h.device)
-        try:
-            if subdiv is not None:
-                subdiv_device = getattr(subdiv, "device", None)
-                if subdiv_device is not None and str(subdiv_device) != str(h.device) and hasattr(subdiv, "to"):
-                    subdiv = subdiv.to(h.device)
-                if hasattr(subdiv, "clear_spatial_cache"):
-                    subdiv.clear_spatial_cache()
-            if subdiv is None:
-                return block(h)
-            return block(h, subdiv=subdiv)
-        finally:
-            block.cpu()
-            self._low_vram_cleanup()
-
     def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
         
         h = self.from_latent(x)
         h = h.type(self.dtype)
-        if _ai3d_use_5070ti_quality_path() and (guide_subs is not None or return_subs):
-            h.clear_spatial_cache()
-        if guide_subs is not None:
-            _ai3d_decode_boundary_log_once(
-                'pipeline_decode_tex_decoder_entry',
-                (
-                    'pipeline_decode_tex_decoder_entry='
-                    f'x_dtype:{str(x.feats.dtype)},x_shape:{tuple(int(v) for v in x.feats.shape)},'
-                    f'x_coords:{int(x.coords.shape[0])},decoder_dtype:{str(self.dtype)},'
-                    f'guide_sub_count:{len(guide_subs)},guide_sub_rows:{[int(sub.feats.shape[0]) for sub in guide_subs]},'
-                    f'guide_sub_dtypes:{[str(sub.feats.dtype) for sub in guide_subs]},'
-                    f'had_channel2spatial_cache:{int(x.get_spatial_cache("channel2spatial_2") is not None)}'
-                ),
-            )
-        elif return_subs:
-            _ai3d_decode_boundary_log_once(
-                'pipeline_decode_shape_decoder_entry',
-                (
-                    'pipeline_decode_shape_decoder_entry='
-                    f'x_dtype:{str(x.feats.dtype)},x_shape:{tuple(int(v) for v in x.feats.shape)},'
-                    f'x_coords:{int(x.coords.shape[0])},decoder_dtype:{str(self.dtype)},'
-                    f'had_channel2spatial_cache:{int(x.get_spatial_cache("channel2spatial_2") is not None)}'
-                ),
-            )
         subs_gt = []
         subs = []
-        low_vram_blocks = bool(self.low_vram and not self.training)
-        if low_vram_blocks:
-            self._prepare_blocks_for_low_vram()
         for i, res in enumerate(self.blocks):
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
                     if self.pred_subdiv:
                         if self.training:
                             subs_gt.append(h.get_spatial_cache('subdivision'))
-                        if low_vram_blocks:
-                            h, sub = self._run_block_low_vram(block, h)
-                        else:
-                            h, sub = block(h)
-                        if return_subs and _ai3d_use_5070ti_quality_path():
-                            stable_sub = _ai3d_stable_sparse_snapshot(sub)
-                            _ai3d_decode_boundary_log_once(
-                                f'pipeline_decode_shape_sub_snapshot_stage_{i}',
-                                (
-                                    f'pipeline_decode_shape_sub_snapshot_stage_{i}='
-                                    f'rows:{int(stable_sub.feats.shape[0])},'
-                                    f'positive_rows:{int((stable_sub.feats > 0).sum().item())},'
-                                    f'dtype:{str(stable_sub.feats.dtype)}'
-                                ),
-                            )
-                            subs.append(stable_sub)
-                        else:
-                            subs.append(sub)
+                        h, sub = block(h)
+                        subs.append(sub)
                     else:
-                        subdiv = guide_subs[i] if guide_subs is not None else None
-                        if subdiv is not None:
-                            current_rows = int(h.coords.shape[0])
-                            subdiv_rows = int(subdiv.feats.shape[0])
-                            if subdiv_rows != current_rows:
-                                matched_index = -1
-                                matched_subdiv = None
-                                for alt_index, alt_subdiv in enumerate(guide_subs):
-                                    if int(alt_subdiv.feats.shape[0]) == current_rows:
-                                        matched_index = alt_index
-                                        matched_subdiv = alt_subdiv
-                                        break
-                                _ai3d_decode_boundary_log_once(
-                                    f'pipeline_decode_tex_guide_sub_mismatch_stage_{i}',
-                                    (
-                                        f'pipeline_decode_tex_guide_sub_mismatch_stage_{i}='
-                                        f'h_rows:{current_rows},guide_rows:{subdiv_rows},'
-                                        f'h_dtype:{str(h.feats.dtype)},guide_dtype:{str(subdiv.feats.dtype)},'
-                                        f'guide_rows_all:{[int(sub.feats.shape[0]) for sub in guide_subs]},'
-                                        f'matched_index:{matched_index}'
-                                    ),
-                                )
-                                if matched_subdiv is not None:
-                                    subdiv = matched_subdiv
-                                    _ai3d_decode_boundary_log_once(
-                                        f'pipeline_decode_tex_guide_sub_resolved_stage_{i}',
-                                        (
-                                            f'pipeline_decode_tex_guide_sub_resolved_stage_{i}='
-                                            f'using_index:{matched_index},rows:{current_rows},dtype:{str(subdiv.feats.dtype)}'
-                                        ),
-                                    )
-                        if low_vram_blocks:
-                            h = self._run_block_low_vram(block, h, subdiv=subdiv)
-                        else:
-                            h = block(h, subdiv=subdiv)
+                        h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
                 else:
-                    if low_vram_blocks:
-                        h = self._run_block_low_vram(block, h)
-                    else:
-                        h = block(h)
+                    h = block(h)
         h = h.type(x.dtype)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
         h = self.output_layer(h)
@@ -769,21 +511,12 @@ class SparseUnetVaeDecoder(nn.Module):
         
         h = self.from_latent(x)
         h = h.type(self.dtype)
-        low_vram_blocks = bool(self.low_vram and not self.training)
-        if low_vram_blocks:
-            self._prepare_blocks_for_low_vram()
         for i, res in enumerate(self.blocks):
             if i == upsample_times:
                 return h.coords
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
-                    if low_vram_blocks:
-                        h, sub = self._run_block_low_vram(block, h)
-                    else:
-                        h, sub = block(h)
+                    h, sub = block(h)
                 else:
-                    if low_vram_blocks:
-                        h = self._run_block_low_vram(block, h)
-                    else:
-                        h = block(h)
+                    h = block(h)
        
