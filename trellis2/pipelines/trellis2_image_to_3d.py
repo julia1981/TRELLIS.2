@@ -5,7 +5,6 @@ import numpy as np
 from PIL import Image
 from .base import Pipeline
 from . import samplers, rembg
-from .. import models as trellis_models
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
@@ -79,29 +78,6 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         }
         self._device = 'cpu'
 
-    def _ai3d_get_or_load_model(self, model_key: str) -> nn.Module:
-        model = self.models.get(model_key)
-        if model is not None:
-            return model
-
-        pretrained_args = getattr(self, '_pretrained_args', None)
-        models_config = pretrained_args.get('models', {}) if isinstance(pretrained_args, dict) else {}
-        model_ref = models_config.get(model_key)
-        if not isinstance(model_ref, str) or not model_ref:
-            raise KeyError(f"Missing pretrained model ref for {model_key}")
-
-        model_source = getattr(self, '_ai3d_model_source', None)
-        try:
-            if isinstance(model_source, str) and model_source:
-                model = trellis_models.from_pretrained(f"{model_source}/{model_ref}")
-            else:
-                model = trellis_models.from_pretrained(model_ref)
-        except Exception:
-            model = trellis_models.from_pretrained(model_ref)
-        model.eval()
-        self.models[model_key] = model
-        return model
-
     @classmethod
     def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Trellis2ImageTo3DPipeline":
         """
@@ -137,7 +113,6 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             'alpha': slice(5, 6),
         }
         pipeline._device = 'cpu'
-        pipeline._ai3d_model_source = path
 
         return pipeline
 
@@ -175,10 +150,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         output_np = np.array(output)
         alpha = output_np[:, :, 3]
         bbox = np.argwhere(alpha > 0.8 * 255)
+        if bbox.size == 0:
+            bbox = np.argwhere(alpha > 0)
+        if bbox.size == 0:
+            # Some local stacks produce an empty mask for difficult inputs.
+            # Keep the resized RGB image instead of failing the entire run.
+            return input.convert('RGB')
         bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
         center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
         size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
-        size = int(size * 1)
+        size = max(int(size * 1), 1)
         bbox = center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
         output = output.crop(bbox)  # type: ignore
         output = np.array(output).astype(np.float32) / 255
@@ -342,14 +323,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         slat = slat * std + mean
         
         # Upsample
-        shape_decoder = self._ai3d_get_or_load_model('shape_slat_decoder')
         if self.low_vram:
-            shape_decoder.to(self.device)
-            shape_decoder.low_vram = True
-        hr_coords = shape_decoder.upsample(slat, upsample_times=4)
+            self.models['shape_slat_decoder'].to(self.device)
+            self.models['shape_slat_decoder'].low_vram = True
+        hr_coords = self.models['shape_slat_decoder'].upsample(slat, upsample_times=4)
         if self.low_vram:
-            shape_decoder.cpu()
-            shape_decoder.low_vram = False
+            self.models['shape_slat_decoder'].cpu()
+            self.models['shape_slat_decoder'].low_vram = False
         hr_resolution = resolution
         while True:
             quant_coords = torch.cat([
@@ -404,15 +384,14 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             List[Mesh]: The decoded meshes.
             List[SparseTensor]: The decoded substructures.
         """
-        shape_decoder = self._ai3d_get_or_load_model('shape_slat_decoder')
-        shape_decoder.set_resolution(resolution)
+        self.models['shape_slat_decoder'].set_resolution(resolution)
         if self.low_vram:
-            shape_decoder.to(self.device)
-            shape_decoder.low_vram = True
-        ret = shape_decoder(slat, return_subs=True)
+            self.models['shape_slat_decoder'].to(self.device)
+            self.models['shape_slat_decoder'].low_vram = True
+        ret = self.models['shape_slat_decoder'](slat, return_subs=True)
         if self.low_vram:
-            shape_decoder.cpu()
-            shape_decoder.low_vram = False
+            self.models['shape_slat_decoder'].cpu()
+            self.models['shape_slat_decoder'].low_vram = False
         return ret
     
     def sample_tex_slat(
@@ -431,7 +410,6 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             sampler_params (dict): Additional parameters for the sampler.
         """
         # Sample structured latent
-        emit_timing = getattr(self, "_ai3d_emit_timing", None)
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(shape_slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(shape_slat.device)
         shape_slat = (shape_slat - mean) / std
@@ -439,37 +417,6 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         in_channels = flow_model.in_channels if isinstance(flow_model, nn.Module) else flow_model[0].in_channels
         noise = shape_slat.replace(feats=torch.randn(shape_slat.coords.shape[0], in_channels - shape_slat.feats.shape[1]).to(self.device))
         sampler_params = {**self.tex_slat_sampler_params, **sampler_params}
-        force_no_tqdm = bool(getattr(self, "_ai3d_force_tex_slat_no_tqdm", False))
-        sampler_disable_tqdm = bool(getattr(self.tex_slat_sampler, "_ai3d_disable_tqdm", False))
-        disable_tqdm = force_no_tqdm or sampler_disable_tqdm
-        sample_verbose = not disable_tqdm
-        if callable(emit_timing):
-            try:
-                emit_timing(
-                    "pipeline_tex_slat_callsite_verbose_resolved",
-                    0,
-                    {
-                        "forceNoTqdm": force_no_tqdm,
-                        "samplerDisableTqdm": sampler_disable_tqdm,
-                        "sampleVerbose": sample_verbose,
-                        "samplerClass": type(self.tex_slat_sampler).__name__,
-                    },
-                )
-            except Exception:
-                pass
-        if disable_tqdm:
-            try:
-                print(
-                    "[ai3d] tex_slat_callsite_verbose_forced",
-                    {
-                        "forceNoTqdm": force_no_tqdm,
-                        "samplerDisableTqdm": sampler_disable_tqdm,
-                        "sampleVerbose": sample_verbose,
-                        "samplerClass": type(self.tex_slat_sampler).__name__,
-                    },
-                )
-            except Exception:
-                pass
         if self.low_vram:
             flow_model.to(self.device)
         slat = self.tex_slat_sampler.sample(
@@ -478,76 +425,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             concat_cond=shape_slat,
             **cond,
             **sampler_params,
-            verbose=sample_verbose,
+            verbose=True,
             tqdm_desc="Sampling texture SLat",
         ).samples
-        if callable(emit_timing):
-            try:
-                emit_timing(
-                    "pipeline_tex_slat_internal_samples_ready",
-                    0,
-                    {
-                        "device": str(getattr(slat, "device", "unknown")),
-                        "shape": tuple(int(v) for v in getattr(slat, "shape", ())),
-                        "featureShape": tuple(int(v) for v in getattr(getattr(slat, "feats", None), "shape", ())),
-                    },
-                )
-            except Exception:
-                pass
-        try:
-            del noise
-        except Exception:
-            pass
-        try:
-            del shape_slat
-        except Exception:
-            pass
         if self.low_vram:
             flow_model.cpu()
-            if callable(emit_timing):
-                try:
-                    emit_timing("pipeline_tex_slat_internal_flow_model_offload", 0)
-                except Exception:
-                    pass
 
         std = torch.tensor(self.tex_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(slat.device)
-        if callable(emit_timing):
-            try:
-                emit_timing(
-                    "pipeline_tex_slat_internal_norm_stats_ready",
-                    0,
-                    {
-                        "device": str(getattr(std, "device", "unknown")),
-                        "shape": tuple(int(v) for v in getattr(std, "shape", ())),
-                    },
-                )
-            except Exception:
-                pass
-        slat_feats = getattr(slat, "feats", None)
-        if torch.is_tensor(slat_feats):
-            slat_feats.mul_(std).add_(mean)
-        else:
-            slat = slat * std + mean
-        if callable(emit_timing):
-            try:
-                emit_timing(
-                    "pipeline_tex_slat_internal_denorm_ready",
-                    0,
-                    {
-                        "device": str(getattr(slat, "device", "unknown")),
-                        "shape": tuple(int(v) for v in getattr(slat, "shape", ())),
-                        "featureShape": tuple(int(v) for v in getattr(getattr(slat, "feats", None), "shape", ())),
-                    },
-                )
-            except Exception:
-                pass
+        slat = slat * std + mean
         
-        if callable(emit_timing):
-            try:
-                emit_timing("pipeline_tex_slat_internal_return_ready", 0)
-            except Exception:
-                pass
         return slat
 
     def decode_tex_slat(
@@ -564,12 +451,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         Returns:
             SparseTensor: The decoded texture voxels
         """
-        tex_decoder = self._ai3d_get_or_load_model('tex_slat_decoder')
         if self.low_vram:
-            tex_decoder.to(self.device)
-        ret = tex_decoder(slat, guide_subs=subs) * 0.5 + 0.5
+            self.models['tex_slat_decoder'].to(self.device)
+        ret = self.models['tex_slat_decoder'](slat, guide_subs=subs) * 0.5 + 0.5
         if self.low_vram:
-            tex_decoder.cpu()
+            self.models['tex_slat_decoder'].cpu()
         return ret
     
     @torch.no_grad()
