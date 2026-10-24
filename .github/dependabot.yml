@@ -1,0 +1,22 @@
+# Automated update proposals only. CI and Codex review are required before merge.
+version: 2
+updates:
+- package-ecosystem: gitsubmodule
+  directory: /
+  schedule:
+    interval: weekly
+    time: 06:00
+    timezone: Europe/Berlin
+    day: monday
+  open-pull-requests-limit: 5
+  assignees:
+  - julia1981
+- package-ecosystem: pip
+  directory: /o-voxel
+  schedule:
+    interval: daily
+    time: 06:00
+    timezone: Europe/Berlin
+  open-pull-requests-limit: 5
+  assignees:
+  - julia1981
